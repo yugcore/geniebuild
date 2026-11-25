@@ -1,0 +1,46 @@
+{
+  "cCompiler": "gcc",
+  "cStd": "c17",
+  "compileFlags": [],
+  "compiler": "g++",
+  "configs": {
+    "Debug": {
+      "compileFlags": [],
+      "defines": [
+        "_DEBUG"
+      ],
+      "linkFlags": []
+    },
+    "Release": {
+      "compileFlags": [],
+      "defines": [
+        "NDEBUG"
+      ],
+      "linkFlags": []
+    }
+  },
+  "configuration": "Debug",
+  "confirmLargeBuild": true,
+  "copyDlls": [],
+  "cxxStd": "c++20",
+  "defines": [],
+  "files": [
+    "src/main.cpp",
+    "src/player.cpp"
+  ],
+  "includeDirs": [
+    "include"
+  ],
+  "jobs": 0,
+  "libDirs": [],
+  "libs": [],
+  "linkFlags": [],
+  "outputDir": ".geniebuild/out",
+  "paneWidths": [
+    0.23938657343387604,
+    0.28726398944854736,
+    0.4733494520187378
+  ],
+  "version": 1,
+  "warnings": "-Wall -Wextra"
+}
