@@ -1,5 +1,18 @@
 #include "build_settings_modal.h"
 #include "settings_resolver.h"
+#include "condition.h"
+#include "build_steps.h"
+#include "tool_registry.h"
+#include "toolchain.h"
+#include "msvc_env.h"
+#include "compdb.h"
+#include "fs_util.h"
+#include "hints.h"
+#include "pch.h"
+#include "unity.h"
+#include "compiler_cache.h"
+#include "dep_log.h"
+#include "scheduler.h"
 #include "theme.h"
 #include "icons.h"
 
@@ -8,6 +21,7 @@
 #include <reproc++/reproc.hpp>
 
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -19,16 +33,24 @@ namespace ui {
 
 static bool s_ShowSettingsModal = false;
 static bool s_ShowManageConfigsModal = false;
+static bool s_ShowToolchainManagerModal = false;
 static std::string s_SelectedTargetScope = ""; // "" = Project (Global), else target name
 static std::string s_SelectedFolderScope = ""; // e.g. "src/simd"
 static std::string s_SelectedFileScope = "";   // e.g. "src/hot/mathlib.cpp"
 static std::string s_EffectiveFlagsFile = "";
+static bool s_FocusStepsTab = false;
+static bool s_FocusPchTab = false;
+static bool s_FocusUnityTab = false;
+static int s_SelectedStepIndex = 0;
 
 void OpenBuildSettingsModal(const std::string& target_name) {
     s_ShowSettingsModal = true;
     s_SelectedTargetScope = target_name;
     s_SelectedFolderScope.clear();
     s_SelectedFileScope.clear();
+    s_FocusStepsTab = false;
+    s_FocusPchTab = false;
+    s_FocusUnityTab = false;
 }
 
 void OpenBuildSettingsForOverride(
@@ -40,13 +62,54 @@ void OpenBuildSettingsForOverride(
     s_SelectedTargetScope = target_name;
     s_SelectedFolderScope = folder_rel;
     s_SelectedFileScope = file_rel;
+    s_FocusStepsTab = false;
+    s_FocusPchTab = false;
+    s_FocusUnityTab = false;
     if (!file_rel.empty()) {
         s_EffectiveFlagsFile = file_rel;
     }
 }
 
+void OpenBuildSettingsForSteps(
+    const std::string& target_name,
+    int step_index
+) {
+    s_ShowSettingsModal = true;
+    s_SelectedTargetScope = target_name;
+    s_SelectedFolderScope.clear();
+    s_SelectedFileScope.clear();
+    s_FocusStepsTab = true;
+    s_FocusPchTab = false;
+    s_FocusUnityTab = false;
+    s_SelectedStepIndex = step_index;
+}
+
+void OpenBuildSettingsForPch(const std::string& target_name) {
+    s_ShowSettingsModal = true;
+    s_SelectedTargetScope = target_name;
+    s_SelectedFolderScope.clear();
+    s_SelectedFileScope.clear();
+    s_FocusStepsTab = false;
+    s_FocusPchTab = true;
+    s_FocusUnityTab = false;
+}
+
+void OpenBuildSettingsForUnity(const std::string& target_name) {
+    s_ShowSettingsModal = true;
+    s_SelectedTargetScope = target_name;
+    s_SelectedFolderScope.clear();
+    s_SelectedFileScope.clear();
+    s_FocusStepsTab = false;
+    s_FocusPchTab = false;
+    s_FocusUnityTab = true;
+}
+
 void OpenManageConfigsModal() {
     s_ShowManageConfigsModal = true;
+}
+
+void OpenToolchainManagerModal() {
+    s_ShowToolchainManagerModal = true;
 }
 
 bool IsBuildSettingsModalOpen() {
@@ -154,6 +217,202 @@ static bool RenderEditableList(
     return modified;
 }
 
+static bool RenderKeyValueMap(
+    const char* label_id,
+    std::map<std::string, std::string>& kv_map,
+    const char* key_hint,
+    const char* val_hint
+) {
+    bool modified = false;
+    const float dpi = Theme::DpiScale;
+    const float row_h = Theme::Btn::DefaultH;
+    const float del_btn_w = Theme::Btn::DelW;
+    ImGui::PushID(label_id);
+
+    std::vector<std::pair<std::string, std::string>> rows(kv_map.begin(), kv_map.end());
+    int delete_idx = -1;
+    bool rows_changed = false;
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        const float avail_w = ImGui::GetContentRegionAvail().x;
+        const float key_w = std::clamp(avail_w * 0.34f, 80.0f * dpi, 180.0f * dpi);
+        const float val_w = std::max(80.0f * dpi, avail_w - key_w - del_btn_w - Theme::Sp::S2 * 2.0f);
+
+        char kbuf[256];
+        std::strncpy(kbuf, rows[i].first.c_str(), sizeof(kbuf) - 1);
+        kbuf[sizeof(kbuf) - 1] = '\0';
+        ImGui::SetNextItemWidth(key_w);
+        if (ImGui::InputTextWithHint("##k", key_hint, kbuf, sizeof(kbuf))) {
+            rows[i].first = kbuf;
+            rows_changed = true;
+        }
+        ImGui::SameLine(0.0f, Theme::Sp::S2);
+
+        char vbuf[512];
+        std::strncpy(vbuf, rows[i].second.c_str(), sizeof(vbuf) - 1);
+        vbuf[sizeof(vbuf) - 1] = '\0';
+        ImGui::SetNextItemWidth(val_w);
+        if (ImGui::InputTextWithHint("##v", val_hint, vbuf, sizeof(vbuf))) {
+            rows[i].second = vbuf;
+            rows_changed = true;
+        }
+        ImGui::SameLine(0.0f, Theme::Sp::S2);
+
+        if (Theme::DangerIconButton("##del", ICON_FA_XMARK, "Remove entry", ImVec2(del_btn_w, row_h))) {
+            delete_idx = static_cast<int>(i);
+        }
+        ImGui::PopID();
+    }
+
+    if (delete_idx >= 0 && delete_idx < static_cast<int>(rows.size())) {
+        rows.erase(rows.begin() + delete_idx);
+        rows_changed = true;
+    }
+
+    static std::map<std::string, std::string> s_NewKeys;
+    static std::map<std::string, std::string> s_NewVals;
+    std::string id_str(label_id);
+    char nk[256];
+    char nv[512];
+    std::strncpy(nk, s_NewKeys[id_str].c_str(), sizeof(nk) - 1);
+    nk[sizeof(nk) - 1] = '\0';
+    std::strncpy(nv, s_NewVals[id_str].c_str(), sizeof(nv) - 1);
+    nv[sizeof(nv) - 1] = '\0';
+
+    const float avail_w = ImGui::GetContentRegionAvail().x;
+    const float add_w = 72.0f * dpi;
+    const float key_w = std::clamp(avail_w * 0.34f, 80.0f * dpi, 180.0f * dpi);
+    const float val_w = std::max(80.0f * dpi, avail_w - key_w - add_w - Theme::Sp::S2 * 2.0f);
+    ImGui::SetNextItemWidth(key_w);
+    if (ImGui::InputTextWithHint("##newk", key_hint, nk, sizeof(nk))) s_NewKeys[id_str] = nk;
+    ImGui::SameLine(0.0f, Theme::Sp::S2);
+    ImGui::SetNextItemWidth(val_w);
+    if (ImGui::InputTextWithHint("##newv", val_hint, nv, sizeof(nv))) s_NewVals[id_str] = nv;
+    ImGui::SameLine(0.0f, Theme::Sp::S2);
+    if (Theme::Button("+ Add##addkv", "Add environment variable", false, ImVec2(add_w, row_h))) {
+        if (!s_NewKeys[id_str].empty()) {
+            rows.emplace_back(s_NewKeys[id_str], s_NewVals[id_str]);
+            s_NewKeys[id_str].clear();
+            s_NewVals[id_str].clear();
+            rows_changed = true;
+        }
+    }
+
+    if (rows_changed) {
+        kv_map.clear();
+        for (const auto& kv : rows) {
+            if (!kv.first.empty()) kv_map[kv.first] = kv.second;
+        }
+        modified = true;
+    }
+
+    ImGui::PopID();
+    return modified;
+}
+
+// Editable library list supporting optional V2-5 "if" condition per entry
+static bool RenderConditionalLibsList(
+    const char* label_id,
+    std::vector<std::string>& libs,
+    std::map<std::string, std::string>& lib_conds,
+    const core::Project& project,
+    const char* add_hint = "Add library"
+) {
+    bool modified = false;
+    const float dpi = Theme::DpiScale;
+    const float row_h = Theme::Btn::DefaultH;
+    const float del_btn_w = Theme::Btn::DelW;
+    const float cond_w = 155.0f * dpi;
+    const core::ConditionContext cond_ctx = core::BuildConditionContext(project);
+
+    ImGui::PushID(label_id);
+    int delete_idx = -1;
+
+    for (size_t i = 0; i < libs.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        std::string old_name = libs[i];
+        std::string cur_cond = lib_conds.count(old_name) ? lib_conds[old_name] : "";
+        core::ConditionEvalResult ev = core::EvaluateCondition(cur_cond, cond_ctx);
+
+        const float avail_w = ImGui::GetContentRegionAvail().x;
+        const float name_w = std::max(100.0f * dpi, avail_w - cond_w - del_btn_w - Theme::Sp::S2 * 2);
+
+        char nbuf[256];
+        std::strncpy(nbuf, old_name.c_str(), sizeof(nbuf) - 1);
+        nbuf[sizeof(nbuf) - 1] = '\0';
+
+        if (!ev.active) {
+            ImGui::PushStyleColor(ImGuiCol_Text, Theme::Col::Inactive);
+        }
+        ImGui::SetNextItemWidth(name_w);
+        if (ImGui::InputText("##libname", nbuf, sizeof(nbuf))) {
+            std::string new_name = nbuf;
+            if (!cur_cond.empty()) {
+                lib_conds.erase(old_name);
+                if (!new_name.empty()) lib_conds[new_name] = cur_cond;
+            }
+            libs[i] = new_name;
+            modified = true;
+        }
+        if (!ev.active) {
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                Theme::Tooltip(ev.reason.c_str());
+            }
+        }
+
+        ImGui::SameLine(0.0f, Theme::Sp::S2);
+
+        char cbuf[256];
+        std::strncpy(cbuf, cur_cond.c_str(), sizeof(cbuf) - 1);
+        cbuf[sizeof(cbuf) - 1] = '\0';
+        ImGui::SetNextItemWidth(cond_w);
+        if (!ev.valid) {
+            ImGui::PushStyleColor(ImGuiCol_Text, Theme::Col::Error);
+        }
+        if (ImGui::InputTextWithHint("##libcond", "if (optional)", cbuf, sizeof(cbuf))) {
+            if (!libs[i].empty()) {
+                if (cbuf[0] == '\0') lib_conds.erase(libs[i]);
+                else lib_conds[libs[i]] = cbuf;
+            }
+            modified = true;
+        }
+        if (!ev.valid) {
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                Theme::Tooltip(ev.error.c_str());
+            }
+        } else if (!ev.active && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            Theme::Tooltip(ev.reason.c_str());
+        }
+
+        ImGui::SameLine(0.0f, Theme::Sp::S2);
+        if (Theme::DangerIconButton("##del", ICON_FA_XMARK, "Remove library", ImVec2(del_btn_w, row_h))) {
+            delete_idx = static_cast<int>(i);
+        }
+
+        if (!ev.valid) {
+            ImGui::TextColored(Theme::Col::Error, "  %s %s", ICON_FA_CIRCLE_EXCLAMATION, ev.error.c_str());
+        }
+        ImGui::PopID();
+    }
+
+    if (delete_idx >= 0 && delete_idx < static_cast<int>(libs.size())) {
+        lib_conds.erase(libs[static_cast<size_t>(delete_idx)]);
+        libs.erase(libs.begin() + delete_idx);
+        modified = true;
+    }
+
+    ImGui::Spacing();
+    if (Theme::Button("+ Add", add_hint, false, ImVec2(0.0f, Theme::Btn::DefaultH))) {
+        libs.push_back("");
+        modified = true;
+    }
+    ImGui::PopID();
+    return modified;
+}
+
 // Executes pkg-config --cflags --libs <pkg> and adds flags to project settings (Spec §5.1.2)
 static bool RunPkgConfig(const std::string& package_name, core::Project& project, std::string& out_msg) {
     if (package_name.empty()) return false;
@@ -230,7 +489,7 @@ static bool RunPkgConfig(const std::string& package_name, core::Project& project
     return true;
 }
 
-void RenderBuildSettingsModal(core::Project& project, const core::CompilerManager& compiler_manager) {
+void RenderBuildSettingsModal(core::Project& project, core::CompilerManager& compiler_manager) {
     if (s_ShowSettingsModal) {
         ImGui::OpenPopup("Build Settings##Modal");
     }
@@ -393,6 +652,25 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
         const float preview_footer_reserve = Theme::Dim::CmdBoxH + Theme::Btn::DefaultH + Theme::Sp::S4 * 3.5f;
         const float tab_scroll_h = std::max(140.0f * dpi, ImGui::GetContentRegionAvail().y - preview_footer_reserve);
 
+        // V2-5: Show clear error banner in Settings if any condition expression is invalid
+        {
+            std::string cond_banner_err;
+            if (!core::ValidateAllTargetConditions(targets, cond_banner_err)) {
+                ImGui::TextColored(Theme::Col::Error, "%s %s", ICON_FA_CIRCLE_EXCLAMATION, cond_banner_err.c_str());
+                ImGui::Spacing();
+            } else {
+                for (const auto& [ln, lc] : project.GetLibConditions()) {
+                    std::string cerr;
+                    if (!lc.empty() && !core::ValidateCondition(lc, cerr)) {
+                        ImGui::TextColored(Theme::Col::Error, "%s Project library '%s' invalid condition '%s': %s",
+                            ICON_FA_CIRCLE_EXCLAMATION, ln.c_str(), lc.c_str(), cerr.c_str());
+                        ImGui::Spacing();
+                        break;
+                    }
+                }
+            }
+        }
+
         if (!s_SelectedTargetScope.empty() && (!s_SelectedFolderScope.empty() || !s_SelectedFileScope.empty())) {
             // -----------------------------------------------------------------
             // V2-3 Folder / File Override Scope Editor
@@ -528,7 +806,7 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                             }
                         }
 
-                        // Condition
+                        // Condition (V2-5 live validation)
                         {
                             bool is_ov = !ov_work.condition.empty();
                             ImGui::TextColored(is_ov ? Theme::Col::Accent : Theme::Col::TextDim, is_ov ? "* Condition (if):" : "  Condition (if):");
@@ -540,6 +818,17 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                             if (ImGui::InputTextWithHint("##OvCond", "e.g. gcc || clang", cbuf, sizeof(cbuf))) {
                                 ov_work.condition = cbuf;
                                 ov_modified = true;
+                            }
+                            if (!ov_work.condition.empty()) {
+                                core::ConditionEvalResult ev = core::EvaluateCondition(ov_work.condition, core::BuildConditionContext(project));
+                                ImGui::SameLine();
+                                if (!ev.valid) {
+                                    ImGui::TextColored(Theme::Col::Error, "%s %s", ICON_FA_CIRCLE_EXCLAMATION, ev.error.c_str());
+                                } else if (ev.active) {
+                                    ImGui::TextColored(Theme::Col::Success, "active");
+                                } else {
+                                    ImGui::TextColored(Theme::Col::Warning, "%s", ev.reason.c_str());
+                                }
                             }
                         }
 
@@ -695,6 +984,29 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                             t_modified = true;
                         }
 
+                        ImGui::Spacing();
+                        ImGui::TextColored(Theme::Col::Text, "Condition (if):");
+                        ImGui::SameLine(Theme::Dim::FormLabelW);
+                        char tcond_buf[256];
+                        std::strncpy(tcond_buf, t_edit.condition.c_str(), sizeof(tcond_buf) - 1);
+                        tcond_buf[sizeof(tcond_buf) - 1] = '\0';
+                        ImGui::SetNextItemWidth(240.0f * dpi);
+                        if (ImGui::InputTextWithHint("##TargetCond", "e.g. windows && !config:Shipping", tcond_buf, sizeof(tcond_buf))) {
+                            t_edit.condition = tcond_buf;
+                            t_modified = true;
+                        }
+                        if (!t_edit.condition.empty()) {
+                            core::ConditionEvalResult tev = core::EvaluateCondition(t_edit.condition, core::BuildConditionContext(project));
+                            ImGui::SameLine();
+                            if (!tev.valid) {
+                                ImGui::TextColored(Theme::Col::Error, "%s %s", ICON_FA_CIRCLE_EXCLAMATION, tev.error.c_str());
+                            } else if (tev.active) {
+                                ImGui::TextColored(Theme::Col::Success, "active");
+                            } else {
+                                ImGui::TextColored(Theme::Col::Warning, "%s", tev.reason.c_str());
+                            }
+                        }
+
                         if (t_edit.kind == core::TargetKind::Shared) {
                             ImGui::Spacing();
                             if (ImGui::Checkbox("Export all symbols (GCC/MinGW -Wl,--export-all-symbols)", &t_edit.exportAll)) {
@@ -716,6 +1028,57 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                             if (Theme::Button("Copy DLL Macro", "Copy __declspec(dllexport/dllimport) macro snippet", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
                                 ImGui::SetClipboardText(snippet.c_str());
                             }
+                        }
+
+                        ImGui::Spacing();
+                        ImGui::Separator();
+                        ImGui::Spacing();
+                        ImGui::TextColored(Theme::Col::Text, "Freestanding / Kernel Target (V2-15):");
+                        if (ImGui::Checkbox("Freestanding / Kernel binary (no OS host runtime)", &t_edit.freestanding)) {
+                            t_modified = true;
+                        }
+                        if (t_edit.freestanding) {
+                            ImGui::Indent(12.0f * dpi);
+                            char ls_buf[512];
+                            std::strncpy(ls_buf, t_edit.linkerScript.c_str(), sizeof(ls_buf) - 1);
+                            ls_buf[sizeof(ls_buf) - 1] = '\0';
+                            ImGui::TextColored(Theme::Col::TextDim, "Linker script:");
+                            ImGui::SetNextItemWidth(std::max(140.0f * dpi, ImGui::GetContentRegionAvail().x - 95.0f * dpi));
+                            if (ImGui::InputTextWithHint("##TgtLinkerScript", "e.g. linker.ld", ls_buf, sizeof(ls_buf))) {
+                                t_edit.linkerScript = ls_buf;
+                                t_modified = true;
+                            }
+                            ImGui::SameLine(0.0f, Theme::Sp::S1);
+                            if (Theme::Button("Browse...##LsBrowse", "Pick linker script (.ld / .lds)", false, ImVec2(85.0f * dpi, Theme::Btn::DefaultH))) {
+                                nfdchar_t* out_ls = nullptr;
+                                std::string root_s = project.GetRootPath().generic_u8string();
+                                nfdu8filteritem_t ls_filter[1] = { { "Linker Scripts", "ld,lds" } };
+                                if (NFD_OpenDialog(&out_ls, ls_filter, 1, root_s.empty() ? nullptr : root_s.c_str()) == NFD_OKAY && out_ls) {
+                                    t_edit.linkerScript = MakeRelativeIfInside(std::filesystem::u8path(out_ls), project.GetRootPath());
+                                    NFD_FreePath(out_ls);
+                                    t_modified = true;
+                                }
+                            }
+
+                            char entry_buf[128];
+                            std::strncpy(entry_buf, t_edit.entry.c_str(), sizeof(entry_buf) - 1);
+                            entry_buf[sizeof(entry_buf) - 1] = '\0';
+                            ImGui::TextColored(Theme::Col::TextDim, "Entry symbol:");
+                            ImGui::SetNextItemWidth(220.0f * dpi);
+                            if (ImGui::InputTextWithHint("##TgtEntry", "_start", entry_buf, sizeof(entry_buf))) {
+                                t_edit.entry = entry_buf;
+                                t_modified = true;
+                            }
+                            ImGui::SameLine(0.0f, Theme::Sp::S2);
+                            if (ImGui::Checkbox("Link libgcc (-lgcc)", &t_edit.linkLibgcc)) {
+                                t_modified = true;
+                            }
+
+                            ImGui::TextColored(Theme::Col::TextDim, "C++-only flags (cxxFlags):");
+                            if (RenderEditableList("TargetCxxFlags", t_edit.cxxFlags, false, false, project, "Add C++-only flag (e.g. -fno-exceptions)")) {
+                                t_modified = true;
+                            }
+                            ImGui::Unindent(12.0f * dpi);
                         }
 
                         ImGui::Spacing();
@@ -768,7 +1131,7 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                         if (RenderEditableList((std::string(id_prefix) + "_ldir").c_str(), blk.libDirs, true, true, project, "Add lib dir")) t_modified = true;
                         ImGui::Spacing();
                         ImGui::TextColored(Theme::Col::TextDim, "Libraries:");
-                        if (RenderEditableList((std::string(id_prefix) + "_libs").c_str(), blk.libs, false, false, project, "Add library")) t_modified = true;
+                        if (RenderConditionalLibsList((std::string(id_prefix) + "_libs").c_str(), blk.libs, blk.libConditions, project, "Add library")) t_modified = true;
                         ImGui::Spacing();
                         ImGui::TextColored(Theme::Col::TextDim, "Compile Flags:");
                         if (RenderEditableList((std::string(id_prefix) + "_cf").c_str(), blk.compileFlags, false, false, project, "Add compile flag")) t_modified = true;
@@ -817,15 +1180,23 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                             ImGui::TextColored(Theme::Col::TextDim, "No per-folder or per-file overrides yet.\nRight-click any folder or file and choose 'Set flags for this folder/file...'.");
                         } else {
                             int del_ov = -1;
+                            const core::ConditionContext ov_ctx = core::BuildConditionContext(project);
                             for (size_t oi = 0; oi < t_edit.overrides.size(); ++oi) {
                                 const auto& ov = t_edit.overrides[oi];
+                                core::ConditionEvalResult oev = core::EvaluateCondition(ov.condition, ov_ctx);
                                 ImGui::PushID(static_cast<int>(oi));
-                                ImGui::TextColored(Theme::Col::Override, "%s", ICON_FA_FLAG);
+                                ImGui::TextColored(oev.active ? Theme::Col::Override : Theme::Col::Inactive, "%s", ICON_FA_FLAG);
                                 ImGui::SameLine(0.0f, Theme::Sp::S1);
-                                ImGui::TextColored(Theme::Col::Text, "%s", ov.match.c_str());
+                                ImGui::TextColored(oev.active ? Theme::Col::Text : Theme::Col::Inactive, "%s", ov.match.c_str());
                                 if (!ov.condition.empty()) {
                                     ImGui::SameLine();
-                                    ImGui::TextColored(Theme::Col::TextDim, "[if %s]", ov.condition.c_str());
+                                    ImVec4 ccol = !oev.valid ? Theme::Col::Error : (oev.active ? Theme::Col::TextDim : Theme::Col::Inactive);
+                                    ImGui::TextColored(ccol, "[if %s]", ov.condition.c_str());
+                                    if (!oev.valid && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                                        Theme::Tooltip(oev.error.c_str());
+                                    } else if (!oev.active && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                                        Theme::Tooltip(oev.reason.c_str());
+                                    }
                                 }
                                 ImGui::SameLine();
                                 if (Theme::Button("Edit", "Open override editor", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
@@ -908,6 +1279,556 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                                 ImGui::EndTable();
                             }
                         }
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
+                    // V2-6: Pre-build and post-build Steps Editor
+                    ImGuiTabItemFlags steps_tab_flags = s_FocusStepsTab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+                    if (ImGui::BeginTabItem("Steps", nullptr, steps_tab_flags)) {
+                        s_FocusStepsTab = false;
+                        ImGui::Spacing();
+                        const float steps_avail_h = tab_scroll_h - ImGui::GetFrameHeightWithSpacing();
+                        static std::vector<core::StepDryRunEntry> s_DryRunResults;
+                        static std::string s_DryRunTargetName;
+
+                        if (s_SelectedStepIndex < 0 && !t_edit.steps.empty()) {
+                            s_SelectedStepIndex = 0;
+                        }
+                        if (s_SelectedStepIndex >= static_cast<int>(t_edit.steps.size())) {
+                            s_SelectedStepIndex = static_cast<int>(t_edit.steps.size()) - 1;
+                        }
+
+                        // Left pane: ordered list of steps (drag-to-reorder) + Add / Remove / Dry Run
+                        ImGui::BeginChild("StepsOrderPane", ImVec2(210.0f * dpi, steps_avail_h), true);
+                        const core::ConditionContext st_ctx = core::BuildConditionContext(project);
+                        int del_step_idx = -1;
+                        int swap_from = -1, swap_to = -1;
+
+                        for (size_t si = 0; si < t_edit.steps.size(); ++si) {
+                            const auto& st = t_edit.steps[si];
+                            core::ConditionEvalResult sev = core::EvaluateCondition(st.condition, st_ctx);
+                            ImGui::PushID(static_cast<int>(si));
+                            std::string label = std::string(ICON_FA_GEAR " ") + (st.name.empty() ? "(unnamed)" : st.name) +
+                                                "  [" + (st.phase == core::StepPhase::PostBuild ? "post" : "pre") + "]";
+                            if (!sev.active) {
+                                ImGui::PushStyleColor(ImGuiCol_Text, Theme::Col::Inactive);
+                            } else if (!sev.valid) {
+                                ImGui::PushStyleColor(ImGuiCol_Text, Theme::Col::Error);
+                            }
+                            if (ImGui::Selectable(label.c_str(), s_SelectedStepIndex == static_cast<int>(si))) {
+                                s_SelectedStepIndex = static_cast<int>(si);
+                            }
+                            if (!sev.active || !sev.valid) {
+                                ImGui::PopStyleColor();
+                                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                                    Theme::Tooltip(sev.valid ? sev.reason.c_str() : sev.error.c_str());
+                                }
+                            }
+
+                            if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                                int idx_payload = static_cast<int>(si);
+                                ImGui::SetDragDropPayload("GENIE_STEP_REORDER", &idx_payload, sizeof(int));
+                                ImGui::TextUnformatted(label.c_str());
+                                ImGui::EndDragDropSource();
+                            }
+                            if (ImGui::BeginDragDropTarget()) {
+                                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("GENIE_STEP_REORDER")) {
+                                    int src_idx = *static_cast<const int*>(payload->Data);
+                                    if (src_idx >= 0 && src_idx < static_cast<int>(t_edit.steps.size()) && src_idx != static_cast<int>(si)) {
+                                        swap_from = src_idx;
+                                        swap_to = static_cast<int>(si);
+                                    }
+                                }
+                                ImGui::EndDragDropTarget();
+                            }
+                            ImGui::PopID();
+                        }
+
+                        if (swap_from >= 0 && swap_to >= 0) {
+                            core::BuildStep moved = std::move(t_edit.steps[static_cast<size_t>(swap_from)]);
+                            t_edit.steps.erase(t_edit.steps.begin() + swap_from);
+                            t_edit.steps.insert(t_edit.steps.begin() + swap_to, std::move(moved));
+                            s_SelectedStepIndex = swap_to;
+                            t_modified = true;
+                        }
+
+                        ImGui::Spacing();
+                        ImGui::Separator();
+                        ImGui::Spacing();
+                        if (Theme::Button("+ Add Step", "Add a pre-build or post-build step", false, ImVec2(-1, Theme::Btn::SmallH))) {
+                            core::BuildStep ns;
+                            ns.name = "step " + std::to_string(t_edit.steps.size() + 1);
+                            ns.phase = core::StepPhase::PreBuild;
+                            t_edit.steps.push_back(std::move(ns));
+                            s_SelectedStepIndex = static_cast<int>(t_edit.steps.size()) - 1;
+                            t_modified = true;
+                        }
+                        if (Theme::Button("Add Preset...", "Insert a built-in OS/image post-build step preset (V2-16)", false, ImVec2(-1, Theme::Btn::SmallH))) {
+                            ImGui::OpenPopup("StepPresetsPopup");
+                        }
+                        if (ImGui::BeginPopup("StepPresetsPopup")) {
+                            auto presets = core::GetBuiltInStepPresets();
+                            auto tc_res = compiler_manager.ResolveProjectToolchain(project);
+                            for (const auto& ps : presets) {
+                                bool tool_ok = true;
+                                if (!ps.requiredTool.empty()) {
+                                    if (ps.requiredTool == "objcopy") {
+                                        tool_ok = !tc_res.profile.objcopy.empty() || !core::ToolRegistry::ResolveToolExecutable("objcopy", project.GetToolOverrides()).empty();
+                                    } else if (ps.requiredTool == "ld") {
+                                        tool_ok = !tc_res.profile.ld.empty() || !core::ToolRegistry::ResolveToolExecutable("ld", project.GetToolOverrides()).empty();
+                                    } else {
+                                        tool_ok = !core::ToolRegistry::ResolveToolExecutable(ps.requiredTool, project.GetToolOverrides()).empty();
+                                    }
+                                }
+                                std::string item_lbl = ps.label + (tool_ok ? "" : "  [tool missing]");
+                                if (ImGui::MenuItem(item_lbl.c_str())) {
+                                    t_edit.steps.push_back(ps.step);
+                                    s_SelectedStepIndex = static_cast<int>(t_edit.steps.size()) - 1;
+                                    t_modified = true;
+                                }
+                                if (!tool_ok && !ps.missingHint.empty()) {
+                                    Theme::Tooltip(ps.missingHint.c_str());
+                                }
+                            }
+                            ImGui::EndPopup();
+                        }
+                        if (s_SelectedStepIndex >= 0 && s_SelectedStepIndex < static_cast<int>(t_edit.steps.size())) {
+                            if (Theme::Button("Move Up", nullptr, false, ImVec2(92.0f * dpi, Theme::Btn::SmallH)) && s_SelectedStepIndex > 0) {
+                                std::swap(t_edit.steps[static_cast<size_t>(s_SelectedStepIndex)], t_edit.steps[static_cast<size_t>(s_SelectedStepIndex - 1)]);
+                                s_SelectedStepIndex--;
+                                t_modified = true;
+                            }
+                            ImGui::SameLine();
+                            if (Theme::Button("Move Down", nullptr, false, ImVec2(92.0f * dpi, Theme::Btn::SmallH)) &&
+                                s_SelectedStepIndex + 1 < static_cast<int>(t_edit.steps.size())) {
+                                std::swap(t_edit.steps[static_cast<size_t>(s_SelectedStepIndex)], t_edit.steps[static_cast<size_t>(s_SelectedStepIndex + 1)]);
+                                s_SelectedStepIndex++;
+                                t_modified = true;
+                            }
+                            if (Theme::Button("Remove Step", nullptr, false, ImVec2(-1, Theme::Btn::SmallH))) {
+                                del_step_idx = s_SelectedStepIndex;
+                            }
+                        }
+                        if (del_step_idx >= 0) {
+                            t_edit.steps.erase(t_edit.steps.begin() + del_step_idx);
+                            if (s_SelectedStepIndex >= static_cast<int>(t_edit.steps.size())) {
+                                s_SelectedStepIndex = static_cast<int>(t_edit.steps.size()) - 1;
+                            }
+                            t_modified = true;
+                        }
+
+                        ImGui::Spacing();
+                        if (Theme::SuccessButton("Dry Run Steps", "Evaluate which steps would run and why without executing", ImVec2(-1, Theme::Btn::SmallH))) {
+                            s_DryRunResults = core::DryRunTargetSteps(project, t_edit, targets, project.GetDirectoryCache());
+                            s_DryRunTargetName = t_edit.name;
+                        }
+                        ImGui::EndChild();
+
+                        ImGui::SameLine(0.0f, Theme::Sp::S3);
+
+                        // Right pane: step fields + Preview + Dry run results
+                        ImGui::BeginChild("StepsDetailPane", ImVec2(0.0f, steps_avail_h), true);
+                        if (s_SelectedStepIndex >= 0 && s_SelectedStepIndex < static_cast<int>(t_edit.steps.size())) {
+                            core::BuildStep& st = t_edit.steps[static_cast<size_t>(s_SelectedStepIndex)];
+                            ImGui::PushID(s_SelectedStepIndex);
+
+                            auto edit_text = [&](const char* lbl, const char* id, std::string& val, const char* hint) {
+                                ImGui::TextColored(Theme::Col::Text, "%s", lbl);
+                                ImGui::SameLine(115.0f * dpi);
+                                char buf[512];
+                                std::strncpy(buf, val.c_str(), sizeof(buf) - 1);
+                                buf[sizeof(buf) - 1] = '\0';
+                                ImGui::SetNextItemWidth(-1);
+                                if (ImGui::InputTextWithHint(id, hint, buf, sizeof(buf))) {
+                                    val = buf;
+                                    t_modified = true;
+                                }
+                            };
+
+                            edit_text("Name:", "##StName", st.name, "e.g. shaders");
+
+                            ImGui::TextColored(Theme::Col::Text, "Phase:");
+                            ImGui::SameLine(115.0f * dpi);
+                            const char* phases[] = { "preBuild", "postBuild" };
+                            std::string cur_ph = core::StepPhaseToString(st.phase);
+                            ImGui::SetNextItemWidth(160.0f * dpi);
+                            if (ImGui::BeginCombo("##StPhase", cur_ph.c_str())) {
+                                for (const char* p : phases) {
+                                    if (ImGui::Selectable(p, cur_ph == p)) {
+                                        st.phase = core::StepPhaseFromString(p);
+                                        t_modified = true;
+                                    }
+                                }
+                                ImGui::EndCombo();
+                            }
+
+                            edit_text("Condition (if):", "##StCond", st.condition, "optional, e.g. windows && !config:Shipping");
+                            if (!st.condition.empty()) {
+                                core::ConditionEvalResult sev = core::EvaluateCondition(st.condition, st_ctx);
+                                if (!sev.valid) {
+                                    ImGui::TextColored(Theme::Col::Error, "  %s %s", ICON_FA_CIRCLE_EXCLAMATION, sev.error.c_str());
+                                } else if (!sev.active) {
+                                    ImGui::TextColored(Theme::Col::Warning, "  %s", sev.reason.c_str());
+                                }
+                            }
+
+                            edit_text("Foreach glob:", "##StForeach", st.foreachPattern, "e.g. shaders/**/*.{vert,frag,comp}");
+                            if (st.foreachPattern.empty()) {
+                                ImGui::TextColored(Theme::Col::TextDim, "Inputs (when not foreach):");
+                                if (RenderEditableList("StInputs", st.inputs, true, false, project, "Add input glob or path")) {
+                                    t_modified = true;
+                                }
+                            }
+
+                            edit_text("Command:", "##StCmd", st.command, "e.g. glslc -MD -MF {out}.d {in} -o {out}");
+                            Theme::Tooltip("Placeholders: {in} {out} {stem} {name} {dir} {gen} {bindir} {libdir} {objdir} {bin} {bin:target} {root} {config} {target} {objcopy} {ld}");
+
+                            ImGui::TextColored(Theme::Col::TextDim, "Outputs:");
+                            if (RenderEditableList("StOutputs", st.outputs, false, false, project, "Add output template (e.g. {gen}/{stem}.pb.cc)")) {
+                                t_modified = true;
+                            }
+
+                            edit_text("Depfile:", "##StDepfile", st.depfile, "optional, e.g. {out}.d");
+
+                            if (ImGui::Checkbox("Generates C/C++ sources", &st.generatesSources)) t_modified = true;
+                            ImGui::SameLine(0.0f, Theme::Sp::S2);
+                            if (ImGui::Checkbox("Use shell", &st.shell)) t_modified = true;
+                            ImGui::SameLine(0.0f, Theme::Sp::S2);
+                            if (ImGui::Checkbox("Always run", &st.always)) t_modified = true;
+
+                            // Live Preview for first input
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            std::vector<std::string> prev_outs;
+                            std::string prev_cmd = core::PreviewStepCommand(project, t_edit, st, project.GetDirectoryCache(), &prev_outs);
+                            ImGui::TextColored(Theme::Col::TextDim, "Preview (first input):");
+                            ImGui::PushFont(g_Fonts.mono);
+                            ImGui::TextWrapped("%s", prev_cmd.empty() ? "(empty command)" : prev_cmd.c_str());
+                            if (!prev_outs.empty()) {
+                                std::string outs_joined;
+                                for (size_t oi = 0; oi < prev_outs.size(); ++oi) {
+                                    if (oi > 0) outs_joined += ", ";
+                                    outs_joined += prev_outs[oi];
+                                }
+                                ImGui::TextColored(Theme::Col::TextDim, "Outputs: %s", outs_joined.c_str());
+                            }
+                            ImGui::PopFont();
+                            ImGui::PopID();
+                        } else {
+                            ImGui::TextColored(Theme::Col::TextDim, "No build steps yet. Click '+ Add Step' to add a pre-build or post-build command.");
+                        }
+
+                        if (!s_DryRunResults.empty() && s_DryRunTargetName == t_edit.name) {
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            ImGui::TextColored(Theme::Col::Accent, "Dry Run Results:");
+                            for (const auto& dr : s_DryRunResults) {
+                                std::string tag = !dr.active ? "[INACTIVE]" : (dr.wouldRun ? "[RUN]" : "[SKIP]");
+                                ImVec4 col = !dr.active ? Theme::Col::Inactive : (dr.wouldRun ? Theme::Col::Warning : Theme::Col::Success);
+                                ImGui::TextColored(col, "%s %s%s — %s",
+                                    tag.c_str(),
+                                    dr.stepName.c_str(),
+                                    dr.label.empty() ? "" : (" (" + dr.label + ")").c_str(),
+                                    dr.reason.c_str());
+                            }
+                        }
+
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
+                    // V2-8: Precompiled Headers (PCH) Tab
+                    ImGuiTabItemFlags pch_tab_flags = s_FocusPchTab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+                    if (ImGui::BeginTabItem("PCH", nullptr, pch_tab_flags)) {
+                        s_FocusPchTab = false;
+                        ImGui::Spacing();
+                        ImGui::BeginChild("TargetPchScroll", ImVec2(0.0f, tab_scroll_h - ImGui::GetFrameHeightWithSpacing()), false);
+
+                        ImGui::TextColored(Theme::Col::TextDim, "Precompiled header shared across compatible translation units in '%s'.", t_edit.name.c_str());
+                        ImGui::Spacing();
+
+                        auto render_file_input = [&](const char* lbl, const char* id, std::string& val, const char* tip) {
+                            ImGui::TextColored(Theme::Col::Text, "%s", lbl);
+                            ImGui::SameLine(Theme::Dim::FormLabelW);
+                            char buf[512];
+                            std::strncpy(buf, val.c_str(), sizeof(buf) - 1);
+                            buf[sizeof(buf) - 1] = '\0';
+                            const float browse_w = 80.0f * dpi;
+                            ImGui::SetNextItemWidth(std::max(120.0f * dpi, ImGui::GetContentRegionAvail().x - browse_w - Theme::Sp::S2));
+                            if (ImGui::InputText(id, buf, sizeof(buf))) {
+                                val = buf;
+                                t_modified = true;
+                            }
+                            Theme::Tooltip(tip);
+                            ImGui::SameLine(0.0f, Theme::Sp::S2);
+                            std::string b_id = std::string("Browse##") + id;
+                            if (Theme::Button(b_id.c_str(), "Pick header/source file", false, ImVec2(browse_w, Theme::Btn::DefaultH))) {
+                                nfdchar_t* outPath = nullptr;
+                                std::string init_dir = project.GetRootPath().generic_u8string();
+                                if (NFD_OpenDialog(&outPath, nullptr, 0, init_dir.empty() ? nullptr : init_dir.c_str()) == NFD_OKAY && outPath) {
+                                    val = MakeRelativeIfInside(std::filesystem::u8path(outPath), project.GetRootPath());
+                                    t_modified = true;
+                                    NFD_FreePath(outPath);
+                                }
+                            }
+                        };
+
+                        render_file_input("C++ PCH Header:", "##PchHeader", t_edit.pch.header, "e.g. src/core/pch.h");
+                        ImGui::Spacing();
+                        render_file_input("C PCH Header:", "##PchCHeader", t_edit.pch.cHeader, "Optional separate PCH for .c files");
+                        ImGui::Spacing();
+                        render_file_input("MSVC PCH Source:", "##PchSource", t_edit.pch.source, "Optional explicit .cpp for MSVC /Yc (auto-generated if empty)");
+                        ImGui::Spacing();
+
+                        ImGui::TextColored(Theme::Col::TextDim, "Exclude Glob Patterns:");
+                        if (RenderEditableList("PchExcludeList", t_edit.pch.exclude, false, false, project, "Add exclude glob (e.g. src/vendor/**)")) {
+                            t_modified = true;
+                        }
+
+                        ImGui::Spacing();
+                        ImGui::Separator();
+                        ImGui::Spacing();
+
+                        // Suggest PCH from deps.bin
+                        static std::string s_SuggestTarget;
+                        static std::vector<core::PchHeaderCandidate> s_SuggestedHeaders;
+                        static bool s_SuggestQueried = false;
+                        static std::string s_SuggestMsg;
+                        if (Theme::Button("Suggest PCH...", "Scan .geniebuild/obj/<Config>/deps.bin for headers used by >= 50% of TUs", false, ImVec2(0.0f, Theme::Btn::DefaultH))) {
+                            s_SuggestTarget = t_edit.name;
+                            s_SuggestedHeaders.clear();
+                            s_SuggestMsg.clear();
+                            s_SuggestQueried = true;
+                            std::filesystem::path deps_path = project.GetRootPath() / ".geniebuild" / "obj" / project.GetConfiguration() / "deps.bin";
+                            if (!std::filesystem::exists(deps_path)) {
+                                s_SuggestMsg = "No dependency log yet (" + deps_path.generic_u8string() + "). Run at least one build first.";
+                            } else {
+                                core::DepLog dlog;
+                                if (dlog.Open(deps_path)) {
+                                    std::filesystem::path obj_dir = t_edit.GetObjectDir(project.GetRootPath(), project.GetConfiguration());
+                                    bool is_msvc = (project.GetCompiler() == "cl");
+                                    std::vector<std::string> outs;
+                                    for (const auto& sf : t_edit.expandedFiles) {
+                                        if (!t_edit.IsFileEnabled(sf)) continue;
+                                        outs.push_back((obj_dir / (sf + (is_msvc ? ".obj" : ".o"))).generic_u8string());
+                                    }
+                                    s_SuggestedHeaders = dlog.SuggestPchHeaders(outs, project.GetRootPath(), 0.5, 20);
+                                    if (s_SuggestedHeaders.empty()) {
+                                        s_SuggestMsg = "No common headers found across >= 50% of target TUs.";
+                                    }
+                                    dlog.Close();
+                                }
+                            }
+                        }
+
+                        if (s_SuggestQueried && s_SuggestTarget == t_edit.name) {
+                            if (!s_SuggestMsg.empty()) {
+                                ImGui::TextColored(Theme::Col::Warning, "%s", s_SuggestMsg.c_str());
+                            } else if (!s_SuggestedHeaders.empty()) {
+                                if (Theme::Button("Generate umbrella header & enable", "Writes .geniebuild/pch/<target>/suggested_pch.h with these includes", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                                    std::filesystem::path sug_rel = std::filesystem::path(".geniebuild") / "pch" / t_edit.name / "suggested_pch.h";
+                                    std::filesystem::path sug_abs = project.GetRootPath() / sug_rel;
+                                    std::filesystem::create_directories(sug_abs.parent_path());
+                                    std::ofstream out(sug_abs, std::ios::binary);
+                                    out << "#pragma once\n";
+                                    for (size_t hi = 0; hi < s_SuggestedHeaders.size() && hi < 12; ++hi) {
+                                        out << "#include \"" << s_SuggestedHeaders[hi].path << "\"\n";
+                                    }
+                                    t_edit.pch.header = sug_rel.generic_u8string();
+                                    t_modified = true;
+                                }
+                                ImGui::Spacing();
+                                for (const auto& cand : s_SuggestedHeaders) {
+                                    std::string c_lbl = cand.path + "  (" + std::to_string(cand.tuCount) + " TUs)";
+                                    if (ImGui::Selectable(c_lbl.c_str(), t_edit.pch.header == cand.path)) {
+                                        t_edit.pch.header = cand.path;
+                                        t_modified = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!t_edit.pch.IsEmpty()) {
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            ImGui::Spacing();
+                            const core::CompilerInfo* comp_info = compiler_manager.FindCompiler(project.GetCompiler());
+                            if (comp_info) {
+                                bool is_msvc = (comp_info->name == "cl");
+                                bool is_clang = (comp_info->name.find("clang") != std::string::npos);
+                                std::unordered_map<std::string, const core::Target*> tmap;
+                                for (const auto& t : targets) tmap[t.name] = &t;
+                                core::EffectiveTargetSettings eff = core::ResolveEffectiveTargetSettings(project, t_edit, tmap, project.GetConfiguration(), is_msvc);
+                                std::vector<std::string> srcs;
+                                std::unordered_map<std::string, std::shared_ptr<const core::EffectiveFileSettings>> feffs;
+                                for (const auto& sf : t_edit.expandedFiles) {
+                                    if (!t_edit.IsFileEnabled(sf)) continue;
+                                    srcs.push_back(sf);
+                                    feffs[sf] = std::make_shared<const core::EffectiveFileSettings>(
+                                        core::ResolveFileSettings(project, t_edit, eff, sf, project.GetConfiguration(), project.GetCompiler(), false)
+                                    );
+                                }
+                                auto an = core::PchManager::AnalyzeAndPlanTargetPch(
+                                    project, t_edit, eff, srcs, feffs, *comp_info, *comp_info,
+                                    project.GetConfiguration(), is_msvc, is_clang, false, false
+                                );
+                                ImGui::TextColored(Theme::Col::Accent, "Compatibility: %zu / %zu files will use PCH", an.includedCount, an.totalCount);
+                                if (ImGui::BeginTable("PchUsageTbl", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                                    ImGui::TableSetupColumn("File", ImGuiTableColumnFlags_WidthStretch, 0.48f);
+                                    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 0.16f);
+                                    ImGui::TableSetupColumn("Reason", ImGuiTableColumnFlags_WidthStretch, 0.36f);
+                                    ImGui::TableHeadersRow();
+                                    size_t limit = std::min<size_t>(an.fileUsages.size(), 150);
+                                    for (size_t i = 0; i < limit; ++i) {
+                                        const auto& u = an.fileUsages[i];
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::TextUnformatted(u.file.c_str());
+                                        ImGui::TableSetColumnIndex(1);
+                                        ImGui::TextColored(u.usesPch ? Theme::Col::Success : Theme::Col::TextDim, u.usesPch ? "PCH" : "Excluded");
+                                        ImGui::TableSetColumnIndex(2);
+                                        ImGui::TextColored(Theme::Col::TextDim, "%s", u.excludeReason.c_str());
+                                    }
+                                    ImGui::EndTable();
+                                }
+                            }
+                        }
+
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
+                    // V2-9: Unity / Jumbo Builds Tab
+                    ImGuiTabItemFlags unity_tab_flags = s_FocusUnityTab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+                    if (ImGui::BeginTabItem("Unity", nullptr, unity_tab_flags)) {
+                        s_FocusUnityTab = false;
+                        ImGui::Spacing();
+                        ImGui::BeginChild("TargetUnityScroll", ImVec2(0.0f, tab_scroll_h - ImGui::GetFrameHeightWithSpacing()), false);
+
+                        if (ImGui::Checkbox("Enable unity / jumbo builds for this target", &t_edit.unity.enabled)) {
+                            t_modified = true;
+                        }
+                        Theme::Tooltip("Groups compatible C/C++ translation units into batched unity files under .geniebuild/unity/");
+                        ImGui::Spacing();
+
+                        int bsz = static_cast<int>(t_edit.unity.batchSize);
+                        ImGui::TextColored(Theme::Col::Text, "Batch Size:");
+                        ImGui::SameLine(Theme::Dim::FormLabelW);
+                        ImGui::SetNextItemWidth(Theme::Dim::FormInputW);
+                        if (ImGui::InputInt("##UnityBatchSize", &bsz, 1, 4)) {
+                            if (bsz < 2) bsz = 2;
+                            if (bsz > 128) bsz = 128;
+                            t_edit.unity.batchSize = static_cast<size_t>(bsz);
+                            t_modified = true;
+                        }
+                        Theme::Tooltip("Maximum source files combined into a single generated unity TU (default 16)");
+                        ImGui::Spacing();
+
+                        if (ImGui::Checkbox("Adaptive hot-file isolation", &t_edit.unity.adaptive)) {
+                            t_modified = true;
+                        }
+                        Theme::Tooltip("Frequently edited files compile standalone instead of rebuilding the whole unity batch; graduates back after one quiet build");
+                        ImGui::Spacing();
+
+                        ImGui::TextColored(Theme::Col::TextDim, "Exclude Glob Patterns:");
+                        if (RenderEditableList("UnityExcludeList", t_edit.unity.exclude, false, false, project, "Add exclude glob (e.g. src/generated/**)")) {
+                            t_modified = true;
+                        }
+
+                        if (t_edit.unity.enabled) {
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            ImGui::Spacing();
+                            std::unordered_map<std::string, const core::Target*> tmap;
+                            for (const auto& t : targets) tmap[t.name] = &t;
+                            bool is_msvc = (project.GetCompiler() == "cl");
+                            core::EffectiveTargetSettings eff = core::ResolveEffectiveTargetSettings(project, t_edit, tmap, project.GetConfiguration(), is_msvc);
+                            std::vector<std::string> srcs;
+                            std::unordered_map<std::string, std::shared_ptr<const core::EffectiveFileSettings>> feffs;
+                            std::unordered_map<std::string, bool> uses_pch;
+                            for (const auto& sf : t_edit.expandedFiles) {
+                                if (!t_edit.IsFileEnabled(sf)) continue;
+                                srcs.push_back(sf);
+                                feffs[sf] = std::make_shared<const core::EffectiveFileSettings>(
+                                    core::ResolveFileSettings(project, t_edit, eff, sf, project.GetConfiguration(), project.GetCompiler(), false)
+                                );
+                            }
+                            auto uplan = core::UnityManager::PlanTargetUnity(
+                                project, t_edit, srcs, feffs, uses_pch, project.GetConfiguration(),
+                                project.GetCompiler(), is_msvc, nullptr, false
+                            );
+                            ImGui::TextColored(Theme::Col::Accent, "Planned Batches: %zu · Standalone: %zu · Hot isolated: %zu",
+                                uplan.batches.size(), uplan.standaloneFiles.size(), uplan.hotFiles.size());
+                            for (const auto& b : uplan.batches) {
+                                ImGui::BulletText("%s (%zu files%s)", b.batchName.c_str(), b.memberFiles.size(), b.isC ? ", C" : ", C++");
+                            }
+                        }
+
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
+                    if (ImGui::BeginTabItem("Run / Debug")) {
+                        ImGui::BeginChild("TargetRunTabScroll", ImVec2(0.0f, 0.0f), false);
+                        ImGui::Spacing();
+                        ImGui::TextColored(Theme::Col::Text, "Run Command (Ctrl+R / Toolbar Run Button):");
+
+                        char rcmd_buf[512];
+                        std::strncpy(rcmd_buf, t_edit.run.command.c_str(), sizeof(rcmd_buf) - 1);
+                        rcmd_buf[sizeof(rcmd_buf) - 1] = '\0';
+                        ImGui::TextColored(Theme::Col::TextDim, "Command:");
+                        ImGui::SetNextItemWidth(-1);
+                        if (ImGui::InputTextWithHint("##TgtRunCmd", "{bin} or qemu-system-x86_64", rcmd_buf, sizeof(rcmd_buf))) {
+                            t_edit.run.command = rcmd_buf;
+                            t_modified = true;
+                        }
+                        Theme::Tooltip("Placeholders: {bin} {bindir} {libdir} {objdir} {gen} {root} {config} {target} {objcopy} {ld}");
+
+                        ImGui::TextColored(Theme::Col::TextDim, "Arguments:");
+                        if (RenderEditableList("TargetRunArgs", t_edit.run.args, false, false, project, "Add run argument (e.g. -cdrom {bindir}/myos.iso)")) {
+                            t_modified = true;
+                        }
+
+                        char rcwd_buf[512];
+                        std::strncpy(rcwd_buf, t_edit.run.cwd.c_str(), sizeof(rcwd_buf) - 1);
+                        rcwd_buf[sizeof(rcwd_buf) - 1] = '\0';
+                        ImGui::TextColored(Theme::Col::TextDim, "Working directory:");
+                        ImGui::SetNextItemWidth(-1);
+                        if (ImGui::InputTextWithHint("##TgtRunCwd", "(defaults to project root)", rcwd_buf, sizeof(rcwd_buf))) {
+                            t_edit.run.cwd = rcwd_buf;
+                            t_modified = true;
+                        }
+
+                        ImGui::TextColored(Theme::Col::TextDim, "Environment overrides (KEY / VALUE, supports PATH+):");
+                        if (RenderKeyValueMap("TargetRunEnv", t_edit.run.env, "KEY or PATH+", "value")) {
+                            t_modified = true;
+                        }
+
+                        if (ImGui::Checkbox("Build before run", &t_edit.run.buildBeforeRun)) {
+                            t_modified = true;
+                        }
+
+                        ImGui::Spacing();
+                        ImGui::Separator();
+                        ImGui::Spacing();
+                        ImGui::TextColored(Theme::Col::Text, "Optional Debugger Command (Toolbar Debug Button):");
+
+                        char dcmd_buf[512];
+                        std::strncpy(dcmd_buf, t_edit.debug.command.c_str(), sizeof(dcmd_buf) - 1);
+                        dcmd_buf[sizeof(dcmd_buf) - 1] = '\0';
+                        ImGui::TextColored(Theme::Col::TextDim, "Debug command:");
+                        ImGui::SetNextItemWidth(-1);
+                        if (ImGui::InputTextWithHint("##TgtDebugCmd", "e.g. qemu-system-x86_64 or gdb", dcmd_buf, sizeof(dcmd_buf))) {
+                            t_edit.debug.command = dcmd_buf;
+                            t_modified = true;
+                        }
+
+                        ImGui::TextColored(Theme::Col::TextDim, "Debug arguments:");
+                        if (RenderEditableList("TargetDebugArgs", t_edit.debug.args, false, false, project, "Add debug argument (e.g. -s -S)")) {
+                            t_modified = true;
+                        }
+
                         ImGui::EndChild();
                         ImGui::EndTabItem();
                     }
@@ -1001,7 +1922,7 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
 
                 ImGui::Spacing();
 
-                // Parallel Jobs
+                // Parallel Jobs & RAM/Scheduler controls (V2-13)
                 ImGui::TextColored(Theme::Col::Text, "Compile Jobs:");
                 ImGui::SameLine(Theme::Dim::FormLabelW);
                 int jobs = project.GetJobs();
@@ -1011,7 +1932,55 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                     if (jobs > 64) jobs = 64;
                     project.SetJobs(jobs);
                 }
-                Theme::Tooltip("Number of parallel worker compilation jobs (0 = auto-detect all CPU cores)");
+                Theme::Tooltip("Number of parallel worker compilation jobs (0 = auto-detect CPU cores, capped by RAM budget)");
+
+                ImGui::Spacing();
+
+                ImGui::TextColored(Theme::Col::Text, "RAM / Job (MB):");
+                ImGui::SameLine(Theme::Dim::FormLabelW);
+                int mem_mb = project.GetMemPerJobMb();
+                ImGui::SetNextItemWidth(Theme::Dim::FormInputW);
+                if (ImGui::InputInt("##MemPerJobInput", &mem_mb, 128, 512)) {
+                    if (mem_mb < 0) mem_mb = 0;
+                    if (mem_mb > 16384) mem_mb = 16384;
+                    project.SetMemPerJobMb(mem_mb);
+                }
+                Theme::Tooltip("Estimated RAM per compiler job in MB (default 512 MB; used when Compile Jobs = 0 to prevent OOM)");
+
+                core::WorkerBudget budget = core::Scheduler::ComputeWorkerBudget(jobs, mem_mb);
+                ImGui::SameLine(0.0f, Theme::Sp::S2);
+                ImGui::TextColored(budget.ramCapped ? Theme::Col::Warning : Theme::Col::TextDim,
+                    "%d active (%d cores, %llu MB free)%s",
+                    budget.workers, budget.cores,
+                    static_cast<unsigned long long>(budget.availRamMb),
+                    budget.ramCapped ? " [RAM-capped]" : "");
+
+                ImGui::Spacing();
+
+                ImGui::TextColored(Theme::Col::Text, "Max Link Jobs:");
+                ImGui::SameLine(Theme::Dim::FormLabelW);
+                int link_jobs = project.GetLinkJobs();
+                ImGui::SetNextItemWidth(Theme::Dim::FormInputW);
+                if (ImGui::InputInt("##LinkJobsInput", &link_jobs, 1, 1)) {
+                    if (link_jobs < 1) link_jobs = 1;
+                    if (link_jobs > 16) link_jobs = 16;
+                    project.SetLinkJobs(link_jobs);
+                }
+                Theme::Tooltip("Concurrent heavy link steps allowed (default 2)");
+
+                ImGui::Spacing();
+
+                bool keep_going = project.GetKeepGoing();
+                if (ImGui::Checkbox("Keep going on errors", &keep_going)) {
+                    project.SetKeepGoing(keep_going);
+                }
+                Theme::Tooltip("Continue building unrelated files/targets after an error instead of cancelling immediately");
+                ImGui::SameLine(0.0f, Theme::Sp::S4);
+                bool low_prio = project.GetLowPriority();
+                if (ImGui::Checkbox("Low CPU priority", &low_prio)) {
+                    project.SetLowPriority(low_prio);
+                }
+                Theme::Tooltip("Run worker subprocesses at below-normal OS priority to keep UI responsive during huge builds");
 
                 ImGui::Spacing();
 
@@ -1032,6 +2001,86 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                     ImGui::EndCombo();
                 }
                 Theme::Tooltip("C compiler used for .c source files in mixed-language projects (§5.1.6)");
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // V2-19 compile_commands.json settings
+                ImGui::TextColored(Theme::Col::Text, "compile_commands.json (clangd / IDE Integration):");
+                core::CompileCommandsConfig cc_cfg = project.GetCompileCommandsConfig();
+                bool cc_mod = false;
+                if (ImGui::Checkbox("Auto-export compile_commands.json after build plan", &cc_cfg.enabled)) {
+                    cc_mod = true;
+                }
+                if (cc_cfg.enabled) {
+                    char ccp_buf[260];
+                    std::strncpy(ccp_buf, cc_cfg.path.c_str(), sizeof(ccp_buf) - 1);
+                    ccp_buf[sizeof(ccp_buf) - 1] = '\0';
+                    ImGui::TextColored(Theme::Col::TextDim, "Output path:");
+                    ImGui::SameLine(Theme::Dim::FormLabelW);
+                    ImGui::SetNextItemWidth(Theme::Dim::FormInputW);
+                    if (ImGui::InputText("##CompDbPath", ccp_buf, sizeof(ccp_buf))) {
+                        cc_cfg.path = ccp_buf;
+                        cc_mod = true;
+                    }
+                    ImGui::SameLine(0.0f, Theme::Sp::S2);
+                    if (ImGui::Checkbox("All configs", &cc_cfg.allConfigs)) {
+                        cc_mod = true;
+                    }
+                }
+                if (cc_mod) {
+                    project.SetCompileCommandsConfig(cc_cfg);
+                }
+                static std::string s_GenCompDbStatus;
+                if (Theme::Button("Export compile_commands.json now", "Write compile_commands.json without building", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                    auto er = core::CompDbManager::ExportCompileCommands(project, compiler_manager);
+                    if (er.success) {
+                        s_GenCompDbStatus = "Exported " + std::to_string(er.entryCount) + " entries" + (er.fileModified ? "." : " (up to date).");
+                    } else {
+                        s_GenCompDbStatus = "Failed: " + er.error;
+                    }
+                }
+                if (!s_GenCompDbStatus.empty()) {
+                    ImGui::SameLine(0.0f, Theme::Sp::S2);
+                    ImGui::TextColored(Theme::Col::Accent, "%s", s_GenCompDbStatus.c_str());
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // V2-21 / V2-22 / V2-23 IDE Preferences & System Status
+                ImGui::TextColored(Theme::Col::Text, "IDE & Scale Preferences:");
+                static core::UserSettings s_UserPrefs;
+                static bool s_UserPrefsLoaded = false;
+                if (!s_UserPrefsLoaded) {
+                    s_UserPrefs = core::HintsManager::LoadUserSettings();
+                    s_UserPrefsLoaded = true;
+                }
+                bool up_changed = false;
+                char ed_buf[260];
+                std::strncpy(ed_buf, s_UserPrefs.editorCommand.c_str(), sizeof(ed_buf) - 1);
+                ed_buf[sizeof(ed_buf) - 1] = '\0';
+                ImGui::TextColored(Theme::Col::TextDim, "Editor command:");
+                ImGui::SameLine(Theme::Dim::FormLabelW);
+                ImGui::SetNextItemWidth(260.0f * dpi);
+                if (ImGui::InputTextWithHint("##EditorCmdInput", "code -g {file}:{line}:{col}", ed_buf, sizeof(ed_buf))) {
+                    s_UserPrefs.editorCommand = ed_buf;
+                    up_changed = true;
+                }
+                Theme::Tooltip("Launched when clicking error/warning diagnostics (e.g. code -g {file}:{line}:{col} or notepad++ -n{line} {file})");
+                if (ImGui::Checkbox("Show performance hints (Defender / Dev Drive)", &s_UserPrefs.showPerformanceHints)) {
+                    up_changed = true;
+                }
+                if (up_changed) {
+                    core::HintsManager::SaveUserSettings(s_UserPrefs);
+                }
+
+                bool lp_enabled = core::fs_util::IsWindowsLongPathsEnabled();
+                ImGui::TextColored(lp_enabled ? Theme::Col::Success : Theme::Col::Warning,
+                    "Windows Long Paths (>260 chars): %s",
+                    lp_enabled ? "Enabled (LongPathsEnabled=1)" : "Disabled (short object hashing active)");
 
                 ImGui::EndChild();
                 ImGui::EndTabItem();
@@ -1199,11 +2248,13 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
 
                 ImGui::Spacing();
 
-                // 2. Library Names
-                ImGui::TextColored(Theme::Col::TextDim, "Libraries (-l<name> or <name>.lib):");
+                // 2. Library Names (with optional V2-5 condition)
+                ImGui::TextColored(Theme::Col::TextDim, "Libraries (-l<name> or <name>.lib) & optional 'if' conditions:");
                 auto libs = project.GetLibs();
-                if (RenderEditableList("LibsList", libs, false, false, project, "Add library name (e.g. SDL2, opengl32)")) {
+                auto lib_conds = project.GetLibConditions();
+                if (RenderConditionalLibsList("LibsList", libs, lib_conds, project, "Add library name (e.g. SDL2, opengl32)")) {
                     project.SetLibs(libs);
+                    project.SetLibConditions(lib_conds);
                 }
 
                 ImGui::Spacing();
@@ -1278,6 +2329,281 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
                 ImGui::TextColored(Theme::Col::TextDim, "Per-Configuration (%s) Linker Flags:", cur_cfg.c_str());
                 if (RenderEditableList("CfgLinkFlagsList", cfg_overrides.linkFlags, false, false, project, "Add config linker flag")) {
                     project.SetConfigOverrides(cur_cfg, cfg_overrides);
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::TextColored(Theme::Col::TextDim, "Binary Dependency Log (deps.bin):");
+                bool ign_sys = project.GetIgnoreSystemHeaders();
+                if (ImGui::Checkbox("Ignore system / toolchain headers in dependency tracking", &ign_sys)) {
+                    project.SetIgnoreSystemHeaders(ign_sys);
+                }
+                Theme::Tooltip("Skip stat() checks on standard library / SDK headers (faster no-op builds)");
+                bool keep_d = project.GetKeepDepFiles();
+                if (ImGui::Checkbox("Keep raw .d depfiles after importing into deps.bin", &keep_d)) {
+                    project.SetKeepDepFiles(keep_d);
+                }
+
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+
+            // -----------------------------------------------------------------
+            // Tab 6: Tools (V2-7)
+            // -----------------------------------------------------------------
+            if (ImGui::BeginTabItem("Tools")) {
+                ImGui::Spacing();
+                ImGui::BeginChild("ToolsTabScroll", ImVec2(0.0f, tab_scroll_h - ImGui::GetFrameHeightWithSpacing()), false);
+
+                ImGui::TextColored(Theme::Col::Text, "Assembler (.asm):");
+                ImGui::SameLine(Theme::Dim::FormLabelW);
+                const char* asm_modes[] = { "auto", "nasm", "ml64" };
+                std::string cur_asm = project.GetAsmMode();
+                ImGui::SetNextItemWidth(Theme::Dim::FormInputW);
+                if (ImGui::BeginCombo("##AsmModeCombo", cur_asm.c_str())) {
+                    for (const char* am : asm_modes) {
+                        if (ImGui::Selectable(am, cur_asm == am)) {
+                            project.SetAsmMode(am);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                auto tool_overrides = project.GetToolOverrides();
+                auto detected_tools = core::ToolRegistry::DetectTools(tool_overrides, false);
+                ImGui::TextColored(Theme::Col::TextDim, "Built-in Extra Language Tools (.rc, .S/.asm, .cu, .ispc):");
+                if (ImGui::BeginTable("ToolsTbl", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                    ImGui::TableSetupColumn("Tool", ImGuiTableColumnFlags_WidthStretch, 0.16f);
+                    ImGui::TableSetupColumn("Detected Path", ImGuiTableColumnFlags_WidthStretch, 0.44f);
+                    ImGui::TableSetupColumn("Override Executable Path", ImGuiTableColumnFlags_WidthStretch, 0.40f);
+                    ImGui::TableHeadersRow();
+                    for (const auto& dt : detected_tools) {
+                        ImGui::TableNextRow();
+                        ImGui::PushID(dt.id.c_str());
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextColored(dt.found ? Theme::Col::Success : Theme::Col::TextDim, "%s", dt.id.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextColored(dt.found ? Theme::Col::Text : Theme::Col::Warning, "%s",
+                            dt.found ? dt.path.c_str() : "not found on PATH");
+                        ImGui::TableSetColumnIndex(2);
+                        char obuf[512];
+                        std::string ov_val = (tool_overrides.count(dt.id) ? tool_overrides[dt.id] : "");
+                        std::strncpy(obuf, ov_val.c_str(), sizeof(obuf) - 1);
+                        obuf[sizeof(obuf) - 1] = '\0';
+                        ImGui::SetNextItemWidth(-1);
+                        if (ImGui::InputText("##ToolOv", obuf, sizeof(obuf))) {
+                            if (obuf[0] == '\0') tool_overrides.erase(dt.id);
+                            else tool_overrides[dt.id] = obuf;
+                            project.SetToolOverrides(tool_overrides);
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::TextColored(Theme::Col::TextDim, "Custom Extension Tools:");
+                auto ctools = project.GetCustomTools();
+                bool ct_changed = false;
+                int remove_ct = -1;
+                for (size_t ci = 0; ci < ctools.size(); ++ci) {
+                    ImGui::PushID(static_cast<int>(ci));
+                    auto& ct = ctools[ci];
+                    char ebuf[64], pbuf[256], abuf[256], obuf[256];
+                    std::strncpy(ebuf, ct.ext.c_str(), sizeof(ebuf) - 1); ebuf[sizeof(ebuf) - 1] = '\0';
+                    std::strncpy(pbuf, ct.program.c_str(), sizeof(pbuf) - 1); pbuf[sizeof(pbuf) - 1] = '\0';
+                    std::strncpy(abuf, ct.args.c_str(), sizeof(abuf) - 1); abuf[sizeof(abuf) - 1] = '\0';
+                    std::strncpy(obuf, ct.output.c_str(), sizeof(obuf) - 1); obuf[sizeof(obuf) - 1] = '\0';
+                    ImGui::SetNextItemWidth(70.0f * dpi);
+                    if (ImGui::InputText("##ct_ext", ebuf, sizeof(ebuf))) { ct.ext = ebuf; ct_changed = true; }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(120.0f * dpi);
+                    if (ImGui::InputText("##ct_prog", pbuf, sizeof(pbuf))) { ct.program = pbuf; ct_changed = true; }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(170.0f * dpi);
+                    if (ImGui::InputText("##ct_args", abuf, sizeof(abuf))) { ct.args = abuf; ct_changed = true; }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(150.0f * dpi);
+                    if (ImGui::InputText("##ct_out", obuf, sizeof(obuf))) { ct.output = obuf; ct_changed = true; }
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Link", &ct.link)) { ct_changed = true; }
+                    ImGui::SameLine();
+                    if (Theme::DangerIconButton("##ct_del", ICON_FA_XMARK, "Remove custom tool", ImVec2(Theme::Btn::DelW, Theme::Btn::DefaultH))) {
+                        remove_ct = static_cast<int>(ci);
+                    }
+                    ImGui::PopID();
+                }
+                if (remove_ct >= 0) {
+                    ctools.erase(ctools.begin() + remove_ct);
+                    ct_changed = true;
+                }
+                if (Theme::Button("+ Add Custom Tool", "Add extension -> custom compiler command rule", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                    core::CustomToolSpec nt;
+                    nt.ext = ".custom";
+                    nt.program = "tool";
+                    nt.args = "{in} -o {out}";
+                    nt.output = "{objdir}/{name}.out";
+                    nt.link = false;
+                    ctools.push_back(std::move(nt));
+                    ct_changed = true;
+                }
+                if (ct_changed) project.SetCustomTools(ctools);
+
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+
+            // -----------------------------------------------------------------
+            // Tab 7: Linker (V2-12)
+            // -----------------------------------------------------------------
+            if (ImGui::BeginTabItem("Linker")) {
+                ImGui::Spacing();
+                ImGui::BeginChild("LinkerTabScroll", ImVec2(0.0f, tab_scroll_h - ImGui::GetFrameHeightWithSpacing()), false);
+
+                std::string comp_low = project.GetCompiler();
+                std::transform(comp_low.begin(), comp_low.end(), comp_low.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                bool is_msvc = (comp_low == "cl" || comp_low == "cl.exe");
+
+                ImGui::TextColored(Theme::Col::Text, "Linker:");
+                ImGui::SameLine(Theme::Dim::FormLabelW);
+                const char* linkers[] = { "auto", "lld", "mold", "gold", "default" };
+                std::string cur_lnk = project.GetLinker();
+                ImGui::SetNextItemWidth(Theme::Dim::FormInputW);
+                if (ImGui::BeginCombo("##LinkerCombo", cur_lnk.c_str())) {
+                    for (const char* lm : linkers) {
+                        bool avail = core::CompilerManager::IsLinkerAvailable(lm, is_msvc);
+                        std::string lbl = std::string(lm) + (avail ? "  (available)" : "  (not on PATH)");
+                        if (ImGui::Selectable(lbl.c_str(), cur_lnk == lm)) {
+                            project.SetLinker(lm);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                bool cur_avail = core::CompilerManager::IsLinkerAvailable(cur_lnk, is_msvc);
+                ImGui::SameLine(0.0f, Theme::Sp::S2);
+                ImGui::TextColored(cur_avail ? Theme::Col::Success : Theme::Col::Warning,
+                    cur_avail ? ICON_FA_CHECK " Ready" : ICON_FA_TRIANGLE_EXCLAMATION " Not detected on PATH");
+
+                ImGui::Spacing();
+                bool inc_link = project.GetIncrementalLink();
+                if (ImGui::Checkbox("Incremental linking (MSVC Debug /INCREMENTAL)", &inc_link)) {
+                    project.SetIncrementalLink(inc_link);
+                }
+
+                ImGui::Spacing();
+                ImGui::TextColored(Theme::Col::Text, "Debug Link Mode:");
+                ImGui::SameLine(Theme::Dim::FormLabelW);
+                const char* dbg_modes[] = { "default", "fastlink", "split-dwarf" };
+                std::string cur_dlink = project.GetDebugLink();
+                ImGui::SetNextItemWidth(Theme::Dim::FormInputW);
+                if (ImGui::BeginCombo("##DebugLinkCombo", cur_dlink.c_str())) {
+                    for (const char* dm : dbg_modes) {
+                        if (ImGui::Selectable(dm, cur_dlink == dm)) {
+                            project.SetDebugLink(dm);
+                            if (std::string(dm) == "split-dwarf") project.SetSplitDwarf(true);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ImGui::Spacing();
+                bool split_dw = project.GetSplitDwarf();
+                if (ImGui::Checkbox("Split DWARF (-gsplit-dwarf + --gdb-index on GCC/Clang)", &split_dw)) {
+                    project.SetSplitDwarf(split_dw);
+                }
+
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+
+            // -----------------------------------------------------------------
+            // Tab 8: Compiler Cache (V2-10, user-level ~/.AppData/GenieBuild/cache.json)
+            // -----------------------------------------------------------------
+            if (ImGui::BeginTabItem("Cache")) {
+                ImGui::Spacing();
+                ImGui::BeginChild("CacheTabScroll", ImVec2(0.0f, tab_scroll_h - ImGui::GetFrameHeightWithSpacing()), false);
+
+                static bool s_CachePrefsLoaded = false;
+                static core::CompilerCachePrefs s_CachePrefs;
+                static std::string s_CacheClearMsg;
+                static bool s_ConfirmCacheClear = false;
+                if (!s_CachePrefsLoaded) {
+                    s_CachePrefs = core::CompilerCacheManager::LoadPrefs();
+                    s_CachePrefsLoaded = true;
+                }
+
+                std::string comp_low = project.GetCompiler();
+                std::transform(comp_low.begin(), comp_low.end(), comp_low.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                bool is_msvc = (comp_low == "cl" || comp_low == "cl.exe");
+                core::DetectedCompilerCache detected = core::CompilerCacheManager::DetectCache(s_CachePrefs, is_msvc, false);
+
+                ImGui::TextColored(Theme::Col::TextDim, "Saved per-user in %s",
+                    core::CompilerCacheManager::GetPrefsFilePath().generic_u8string().c_str());
+                ImGui::Spacing();
+
+                ImGui::TextColored(Theme::Col::Text, "Launcher:");
+                ImGui::SameLine(Theme::Dim::FormLabelW);
+                const char* cache_opts[] = { "auto", "ccache", "sccache", "none" };
+                ImGui::SetNextItemWidth(Theme::Dim::FormInputW);
+                if (ImGui::BeginCombo("##CacheLauncherCombo", s_CachePrefs.launcher.c_str())) {
+                    for (const char* co : cache_opts) {
+                        if (ImGui::Selectable(co, s_CachePrefs.launcher == co)) {
+                            s_CachePrefs.launcher = co;
+                            core::CompilerCacheManager::SavePrefs(s_CachePrefs);
+                            s_CacheClearMsg.clear();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ImGui::Spacing();
+                ImGui::TextColored(Theme::Col::Text, "Max Cache Size:");
+                ImGui::SameLine(Theme::Dim::FormLabelW);
+                char sz_buf[64];
+                std::strncpy(sz_buf, s_CachePrefs.maxSize.c_str(), sizeof(sz_buf) - 1);
+                sz_buf[sizeof(sz_buf) - 1] = '\0';
+                ImGui::SetNextItemWidth(Theme::Dim::FormInputW);
+                if (ImGui::InputText("##CacheMaxSize", sz_buf, sizeof(sz_buf))) {
+                    s_CachePrefs.maxSize = sz_buf;
+                    core::CompilerCacheManager::SavePrefs(s_CachePrefs);
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                if (detected.active) {
+                    ImGui::TextColored(Theme::Col::Success, ICON_FA_CHECK " Active: %s (%s)", detected.name.c_str(), detected.executablePath.c_str());
+                } else {
+                    ImGui::TextColored(Theme::Col::TextDim, "Status: inactive (mode=%s; install ccache or sccache on PATH to enable)", s_CachePrefs.launcher.c_str());
+                }
+
+                ImGui::Spacing();
+                if (!s_ConfirmCacheClear) {
+                    if (Theme::Button("Clear Cache...", "Clear compiler cache entries/stats", false, ImVec2(0.0f, Theme::Btn::DefaultH)) && detected.active) {
+                        s_ConfirmCacheClear = true;
+                        s_CacheClearMsg.clear();
+                    }
+                } else {
+                    ImGui::TextColored(Theme::Col::Warning, "Confirm clearing %s cache?", detected.name.c_str());
+                    ImGui::SameLine();
+                    if (Theme::Button("Confirm Clear", "Execute cache clear", true, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        core::CompilerCacheManager::ClearCache(detected, s_CacheClearMsg);
+                        s_ConfirmCacheClear = false;
+                    }
+                    ImGui::SameLine();
+                    if (Theme::Button("Cancel", "Abort", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        s_ConfirmCacheClear = false;
+                    }
+                }
+                if (!s_CacheClearMsg.empty()) {
+                    ImGui::TextColored(Theme::Col::TextDim, "%s", s_CacheClearMsg.c_str());
                 }
 
                 ImGui::EndChild();
@@ -1569,6 +2895,267 @@ void RenderBuildSettingsModal(core::Project& project, const core::CompilerManage
         if (Theme::Button("Close", "Close Manage Configurations", true, ImVec2(90.0f * dpi, Theme::Btn::DefaultH)) || mc_close) {
             s_CfgErr.clear();
             s_ShowManageConfigsModal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        Theme::EndModal();
+    }
+
+    // Toolchain Manager Modal (V2-14 & V2-17)
+    if (s_ShowToolchainManagerModal) {
+        ImGui::OpenPopup("Toolchain Manager##Modal");
+    }
+    static bool s_TcInit = false;
+    static int s_TcSelectedIdx = 0;
+    static core::ToolchainProfile s_TcEdit;
+    static core::ToolchainTestResult s_TcTestResult;
+    static bool s_TcHasTestResult = false;
+    static std::string s_TcStatusMsg;
+
+    bool tc_close = false;
+    if (Theme::BeginModal("Toolchain Manager##Modal", "Toolchain Manager", ICON_FA_GEAR, Theme::Col::Accent, 820.0f, &tc_close)) {
+        const float dpi = Theme::DpiScale;
+        std::vector<core::ToolchainProfile> all_profiles = compiler_manager.GetMergedToolchains(project);
+        if (!s_TcInit || (s_TcSelectedIdx < 0 && !all_profiles.empty())) {
+            s_TcSelectedIdx = 0;
+            if (!all_profiles.empty()) {
+                std::string active_tc = project.GetToolchain();
+                if (active_tc.empty()) active_tc = project.GetCompiler();
+                for (size_t i = 0; i < all_profiles.size(); ++i) {
+                    if (all_profiles[i].name == active_tc) {
+                        s_TcSelectedIdx = static_cast<int>(i);
+                        break;
+                    }
+                }
+                s_TcEdit = all_profiles[static_cast<size_t>(s_TcSelectedIdx)];
+            }
+            s_TcInit = true;
+            s_TcHasTestResult = false;
+            s_TcStatusMsg.clear();
+        }
+        if (s_TcSelectedIdx >= static_cast<int>(all_profiles.size())) {
+            s_TcSelectedIdx = all_profiles.empty() ? -1 : static_cast<int>(all_profiles.size()) - 1;
+            if (s_TcSelectedIdx >= 0) s_TcEdit = all_profiles[static_cast<size_t>(s_TcSelectedIdx)];
+        }
+
+        // Left list
+        ImGui::BeginChild("TcListPane", ImVec2(235.0f * dpi, 420.0f * dpi), true);
+        for (size_t i = 0; i < all_profiles.size(); ++i) {
+            const auto& p = all_profiles[i];
+            std::string tag = p.isProjectLocal ? " [project]" : (p.detected ? " [auto]" : " [user]");
+            std::string lbl = p.name + tag;
+            if (ImGui::Selectable((lbl + "##tcitem" + std::to_string(i)).c_str(), s_TcSelectedIdx == static_cast<int>(i))) {
+                s_TcSelectedIdx = static_cast<int>(i);
+                s_TcEdit = p;
+                s_TcHasTestResult = false;
+                s_TcStatusMsg.clear();
+            }
+        }
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (Theme::Button("+ Add Manual", "Create a new custom toolchain profile", false, ImVec2(110.0f * dpi, Theme::Btn::SmallH))) {
+            core::ToolchainProfile np;
+            np.name = "custom-tc-" + std::to_string(all_profiles.size() + 1);
+            np.family = core::ToolchainFamily::Gcc;
+            np.cc = "gcc";
+            np.cxx = "g++";
+            np.ar = "ar";
+            np.ld = "ld";
+            np.objcopy = "objcopy";
+            np.os = "freestanding";
+            np.arch = "x64";
+            np.detected = false;
+            np.isProjectLocal = false;
+            auto user_tcs = core::ToolchainManager::LoadUserProfiles();
+            user_tcs.push_back(np);
+            core::ToolchainManager::SaveUserProfiles(user_tcs);
+            s_TcEdit = np;
+            s_TcInit = false;
+            s_TcHasTestResult = false;
+            s_TcStatusMsg = "Added custom user toolchain '" + np.name + "'";
+        }
+        ImGui::SameLine();
+        if (Theme::Button("Duplicate", "Clone selected profile into editable User/Project profile", false, ImVec2(105.0f * dpi, Theme::Btn::SmallH))) {
+            if (s_TcSelectedIdx >= 0 && s_TcSelectedIdx < static_cast<int>(all_profiles.size())) {
+                core::ToolchainProfile cp = s_TcEdit;
+                cp.name = cp.name + "-copy";
+                cp.detected = false;
+                if (cp.isProjectLocal && project.HasProject()) {
+                    auto proj_tcs = project.GetProjectToolchains();
+                    proj_tcs.push_back(cp);
+                    project.SetProjectToolchains(proj_tcs);
+                } else {
+                    cp.isProjectLocal = false;
+                    auto user_tcs = core::ToolchainManager::LoadUserProfiles();
+                    user_tcs.push_back(cp);
+                    core::ToolchainManager::SaveUserProfiles(user_tcs);
+                }
+                s_TcEdit = cp;
+                s_TcInit = false;
+                s_TcHasTestResult = false;
+                s_TcStatusMsg = "Duplicated into '" + cp.name + "'";
+            }
+        }
+        if (Theme::Button("Refresh VS / Auto", "Re-scan PATH and Visual Studio installations (vcvarsall)", false, ImVec2(110.0f * dpi, Theme::Btn::SmallH))) {
+            compiler_manager.DetectCompilers(true);
+            s_TcInit = false;
+            s_TcStatusMsg = "Re-scanned toolchains & Visual Studio environment.";
+        }
+        ImGui::SameLine();
+        bool can_del_tc = (s_TcSelectedIdx >= 0 && !s_TcEdit.detected);
+        if (!can_del_tc) ImGui::BeginDisabled(true);
+        ImGui::PushStyleColor(ImGuiCol_Button, Theme::Col::Danger);
+        bool del_clicked = Theme::Button("Delete##DelTc", "Delete custom toolchain profile", false, ImVec2(105.0f * dpi, Theme::Btn::SmallH));
+        ImGui::PopStyleColor();
+        if (del_clicked) {
+            if (s_TcEdit.isProjectLocal && project.HasProject()) {
+                auto proj_tcs = project.GetProjectToolchains();
+                proj_tcs.erase(std::remove_if(proj_tcs.begin(), proj_tcs.end(), [&](const core::ToolchainProfile& x) { return x.name == s_TcEdit.name; }), proj_tcs.end());
+                project.SetProjectToolchains(proj_tcs);
+            } else {
+                auto user_tcs = core::ToolchainManager::LoadUserProfiles();
+                user_tcs.erase(std::remove_if(user_tcs.begin(), user_tcs.end(), [&](const core::ToolchainProfile& x) { return x.name == s_TcEdit.name; }), user_tcs.end());
+                core::ToolchainManager::SaveUserProfiles(user_tcs);
+            }
+            s_TcInit = false;
+            s_TcHasTestResult = false;
+            s_TcStatusMsg = "Deleted toolchain profile.";
+        }
+        if (!can_del_tc) ImGui::EndDisabled();
+        ImGui::EndChild();
+
+        ImGui::SameLine(0.0f, Theme::Sp::S2);
+
+        // Right detail pane
+        ImGui::BeginChild("TcDetailPane", ImVec2(0.0f, 420.0f * dpi), true);
+        if (s_TcSelectedIdx >= 0) {
+            if (s_TcEdit.detected) {
+                ImGui::TextColored(Theme::Col::TextDim, "Auto-detected profile (click Duplicate to customize flags/tools/env)");
+                ImGui::Spacing();
+            }
+
+            auto tc_text = [&](const char* lbl, const char* id, std::string& val, const char* hint) {
+                ImGui::TextColored(Theme::Col::TextDim, "%s", lbl);
+                char b[512];
+                std::strncpy(b, val.c_str(), sizeof(b) - 1);
+                b[sizeof(b) - 1] = '\0';
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputTextWithHint(id, hint, b, sizeof(b))) {
+                    val = b;
+                }
+            };
+
+            std::string original_name = s_TcEdit.name;
+            bool was_detected = s_TcEdit.detected;
+            if (was_detected) ImGui::BeginDisabled(true);
+
+            tc_text("Profile Name:", "##TcName", s_TcEdit.name, "e.g. x86_64-elf-gcc");
+
+            const char* fam_names[] = { "gcc", "clang", "msvc", "clang-cl" };
+            int fam_idx = static_cast<int>(s_TcEdit.family);
+            ImGui::TextColored(Theme::Col::TextDim, "Family:");
+            ImGui::SetNextItemWidth(160.0f * dpi);
+            if (ImGui::Combo("##TcFam", &fam_idx, fam_names, 4)) {
+                s_TcEdit.family = static_cast<core::ToolchainFamily>(fam_idx);
+            }
+            ImGui::SameLine(0.0f, Theme::Sp::S2);
+            const char* lw_opts[] = { "driver", "ld" };
+            int lw_idx = (s_TcEdit.linkWith == "ld") ? 1 : 0;
+            ImGui::SetNextItemWidth(130.0f * dpi);
+            if (ImGui::Combo("Link with##TcLw", &lw_idx, lw_opts, 2)) {
+                s_TcEdit.linkWith = lw_opts[lw_idx];
+            }
+
+            tc_text("C Compiler (cc):", "##TcCc", s_TcEdit.cc, "gcc / clang / cl.exe");
+            tc_text("C++ Compiler (cxx):", "##TcCxx", s_TcEdit.cxx, "g++ / clang++ / cl.exe");
+            tc_text("Archiver (ar):", "##TcAr", s_TcEdit.ar, "ar / llvm-ar / lib.exe");
+            tc_text("Linker (ld):", "##TcLd", s_TcEdit.ld, "ld / ld.lld / link.exe");
+            tc_text("Objcopy:", "##TcObjcopy", s_TcEdit.objcopy, "objcopy / llvm-objcopy");
+            tc_text("Target Triple (--target):", "##TcTriple", s_TcEdit.targetTriple, "e.g. x86_64-elf");
+            tc_text("Sysroot (--sysroot):", "##TcSysroot", s_TcEdit.sysroot, "e.g. ${root}/sysroot");
+            tc_text("OS (windows/linux/macos/freestanding):", "##TcOs", s_TcEdit.os, "auto if empty");
+            tc_text("Arch (x64/x86/arm64/riscv64):", "##TcArch", s_TcEdit.arch, "auto if empty");
+            tc_text("Compiler Launcher (optional):", "##TcLauncher", s_TcEdit.launcher, "e.g. ccache / sccache");
+
+            ImGui::TextColored(Theme::Col::TextDim, "Environment overrides (KEY / VALUE, supports PATH+):");
+            RenderKeyValueMap("TcEnvList", s_TcEdit.env, "KEY or PATH+", "value");
+
+            ImGui::TextColored(Theme::Col::TextDim, "Extra compile flags:");
+            RenderEditableList("TcCFlags", s_TcEdit.extraCompileFlags, false, false, project, "Add compile flag");
+
+            ImGui::TextColored(Theme::Col::TextDim, "Extra link flags:");
+            RenderEditableList("TcLFlags", s_TcEdit.extraLinkFlags, false, false, project, "Add link flag");
+
+            if (was_detected) ImGui::EndDisabled();
+
+            if (!was_detected) {
+                ImGui::Spacing();
+                if (project.HasProject()) {
+                    bool is_proj = s_TcEdit.isProjectLocal;
+                    if (ImGui::Checkbox("Store in project (.geniebuild/project.json)", &is_proj)) {
+                        s_TcEdit.isProjectLocal = is_proj;
+                    }
+                }
+                if (Theme::SuccessButton("Save Profile", "Save edits to user or project toolchains", ImVec2(120.0f * dpi, Theme::Btn::DefaultH))) {
+                    auto upsert = [&](std::vector<core::ToolchainProfile>& vec) {
+                        for (auto& item : vec) {
+                            if (item.name == original_name || item.name == s_TcEdit.name) {
+                                item = s_TcEdit;
+                                return;
+                            }
+                        }
+                        vec.push_back(s_TcEdit);
+                    };
+                    if (s_TcEdit.isProjectLocal && project.HasProject()) {
+                        auto pt = project.GetProjectToolchains();
+                        upsert(pt);
+                        project.SetProjectToolchains(pt);
+                    } else {
+                        auto ut = core::ToolchainManager::LoadUserProfiles();
+                        upsert(ut);
+                        core::ToolchainManager::SaveUserProfiles(ut);
+                    }
+                    s_TcInit = false;
+                    s_TcStatusMsg = "Saved profile '" + s_TcEdit.name + "'";
+                }
+                ImGui::SameLine();
+            }
+
+            if (Theme::Button("Test Toolchain", "Verify compiler binary by compiling a tiny test program", false, ImVec2(140.0f * dpi, Theme::Btn::DefaultH))) {
+                auto resolved = core::ToolchainManager::ResolveProfileVariables(s_TcEdit, project.GetRootPath());
+                s_TcTestResult = core::ToolchainManager::TestProfile(resolved);
+                s_TcHasTestResult = true;
+            }
+            if (project.HasProject()) {
+                ImGui::SameLine();
+                if (Theme::Button("Set Active for Project", "Use this toolchain in current project", true, ImVec2(165.0f * dpi, Theme::Btn::DefaultH))) {
+                    project.SetToolchain(s_TcEdit.name);
+                    s_TcStatusMsg = "Active project toolchain set to '" + s_TcEdit.name + "'";
+                }
+            }
+
+            if (!s_TcStatusMsg.empty()) {
+                ImGui::Spacing();
+                ImGui::TextColored(Theme::Col::Accent, "%s", s_TcStatusMsg.c_str());
+            }
+            if (s_TcHasTestResult) {
+                ImGui::Spacing();
+                ImVec4 col = s_TcTestResult.success ? Theme::Col::Success : Theme::Col::Error;
+                ImGui::TextColored(col, "%s (%.2fs)", s_TcTestResult.success ? "Toolchain Test PASSED" : "Toolchain Test FAILED", s_TcTestResult.durationSeconds);
+                if (!s_TcTestResult.output.empty()) {
+                    ImGui::PushFont(g_Fonts.mono);
+                    ImGui::TextWrapped("%s", s_TcTestResult.output.c_str());
+                    ImGui::PopFont();
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        if (Theme::Button("Close##TcClose", "Close Toolchain Manager", true, ImVec2(90.0f * dpi, Theme::Btn::DefaultH)) || tc_close) {
+            s_ShowToolchainManagerModal = false;
+            s_TcInit = false;
             ImGui::CloseCurrentPopup();
         }
         Theme::EndModal();

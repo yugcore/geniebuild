@@ -109,6 +109,23 @@ FetchContent_MakeAvailable(nfd)
 set(GENIEBUILD_SOURCES
     main.cpp
     core/project.cpp
+    core/condition.cpp
+    core/build_steps.cpp
+    core/dep_log.cpp
+    core/tool_registry.cpp
+    core/pch.cpp
+    core/unity.cpp
+    core/compiler_cache.cpp
+    core/scheduler.cpp
+    core/msvc_env.cpp
+    core/toolchain.cpp
+    core/run_runner.cpp
+    core/fs_util.cpp
+    core/process_win.cpp
+    core/process_posix.cpp
+    core/hints.cpp
+    core/build_log.cpp
+    core/compdb.cpp
     core/source_rules.cpp
     core/target.cpp
     core/settings_resolver.cpp
@@ -122,8 +139,28 @@ set(GENIEBUILD_SOURCES
     ui/build_settings_modal.cpp
 )
 
+if(WIN32)
+    list(APPEND GENIEBUILD_SOURCES assets/geniebuild.rc)
+endif()
+
 set(GENIEBUILD_HEADERS
     core/project.h
+    core/condition.h
+    core/build_steps.h
+    core/dep_log.h
+    core/tool_registry.h
+    core/pch.h
+    core/unity.h
+    core/compiler_cache.h
+    core/scheduler.h
+    core/msvc_env.h
+    core/toolchain.h
+    core/run_runner.h
+    core/fs_util.h
+    core/child_process.h
+    core/hints.h
+    core/build_log.h
+    core/compdb.h
     core/source_rules.h
     core/target.h
     core/settings_resolver.h
@@ -156,7 +193,7 @@ target_link_libraries(geniebuild PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(geniebuild PRIVATE dwmapi ole32 uuid)
+    target_link_libraries(geniebuild PRIVATE dwmapi ole32 oleaut32 uuid wbemuuid)
 endif()
 
 # On MinGW, statically link the C++ runtime and pthreads so the binary is portable
@@ -170,5 +207,132 @@ add_custom_command(TARGET geniebuild POST_BUILD
     ${CMAKE_CURRENT_SOURCE_DIR}/assets
     $<TARGET_FILE_DIR:geniebuild>/assets
 )
+
+# ------------------------------------------------------------------------------
+# Core Unit & Integration Tests (no UI dependencies)
+# ------------------------------------------------------------------------------
+enable_testing()
+
+set(GENIEBUILD_CORE_SOURCES
+    core/project.cpp
+    core/condition.cpp
+    core/build_steps.cpp
+    core/dep_log.cpp
+    core/tool_registry.cpp
+    core/pch.cpp
+    core/unity.cpp
+    core/compiler_cache.cpp
+    core/scheduler.cpp
+    core/msvc_env.cpp
+    core/toolchain.cpp
+    core/run_runner.cpp
+    core/fs_util.cpp
+    core/process_win.cpp
+    core/process_posix.cpp
+    core/hints.cpp
+    core/build_log.cpp
+    core/compdb.cpp
+    core/source_rules.cpp
+    core/target.cpp
+    core/settings_resolver.cpp
+    core/compiler.cpp
+    core/build_runner.cpp
+)
+
+add_executable(geniebuild_tests
+    tests/test_v2_5_v2_6.cpp
+    ${GENIEBUILD_CORE_SOURCES}
+)
+
+target_include_directories(geniebuild_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+)
+
+target_link_libraries(geniebuild_tests PRIVATE
+    nlohmann_json::nlohmann_json
+    reproc++
+)
+if(WIN32)
+    target_link_libraries(geniebuild_tests PRIVATE ole32 oleaut32 uuid wbemuuid)
+endif()
+
+if(MINGW)
+    target_link_options(geniebuild_tests PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+
+add_test(NAME v2_5_and_v2_6_tests COMMAND geniebuild_tests)
+
+add_executable(geniebuild_v2_7_tests
+    tests/test_v2_7_v2_b.cpp
+    ${GENIEBUILD_CORE_SOURCES}
+)
+
+target_include_directories(geniebuild_v2_7_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+)
+
+target_link_libraries(geniebuild_v2_7_tests PRIVATE
+    nlohmann_json::nlohmann_json
+    reproc++
+)
+if(WIN32)
+    target_link_libraries(geniebuild_v2_7_tests PRIVATE ole32 oleaut32 uuid wbemuuid)
+endif()
+
+if(MINGW)
+    target_link_options(geniebuild_v2_7_tests PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+
+add_test(NAME v2_7_and_v2_b_tests COMMAND geniebuild_v2_7_tests)
+
+add_executable(geniebuild_v2_c_tests
+    tests/test_v2_c.cpp
+    ${GENIEBUILD_CORE_SOURCES}
+)
+
+target_include_directories(geniebuild_v2_c_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+)
+
+target_link_libraries(geniebuild_v2_c_tests PRIVATE
+    nlohmann_json::nlohmann_json
+    reproc++
+)
+if(WIN32)
+    target_link_libraries(geniebuild_v2_c_tests PRIVATE ole32 oleaut32 uuid wbemuuid)
+endif()
+
+if(MINGW)
+    target_link_options(geniebuild_v2_c_tests PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+
+add_test(NAME v2_c_tests COMMAND geniebuild_v2_c_tests)
+
+add_executable(geniebuild_v2_d_tests
+    tests/test_v2_d.cpp
+    ${GENIEBUILD_CORE_SOURCES}
+)
+
+target_include_directories(geniebuild_v2_d_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+)
+
+target_link_libraries(geniebuild_v2_d_tests PRIVATE
+    nlohmann_json::nlohmann_json
+    reproc++
+)
+if(WIN32)
+    target_link_libraries(geniebuild_v2_d_tests PRIVATE ole32 oleaut32 uuid wbemuuid)
+endif()
+
+if(MINGW)
+    target_link_options(geniebuild_v2_d_tests PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+
+add_test(NAME v2_d_tests COMMAND geniebuild_v2_d_tests)
 
 

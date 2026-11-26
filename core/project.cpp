@@ -1,5 +1,6 @@
 #include "project.h"
 #include "settings_resolver.h"
+#include "fs_util.h"
 
 #include <nlohmann/json.hpp>
 
@@ -77,7 +78,8 @@ std::vector<std::string> RecentProjects::Load() {
 void RecentProjects::Add(const std::string& root_path) {
     if (root_path.empty()) return;
     std::error_code ec;
-    if (!std::filesystem::exists(root_path, ec) || ec || !std::filesystem::is_directory(root_path, ec)) {
+    const std::filesystem::path root_lp = fs_util::ToWinLongPath(root_path);
+    if (!fs_util::ExistsLong(root_path) || !std::filesystem::is_directory(root_lp, ec)) {
         return;
     }
     std::string norm = root_path;
@@ -152,12 +154,13 @@ bool Project::ShouldSkipDirectory(const std::string& dir_name) {
 bool Project::IsBuildOutputFolder(const std::filesystem::path& path) {
     if (path.empty()) return false;
     std::error_code ec;
-    if (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_directory(path, ec)) {
+    const std::filesystem::path lp = fs_util::ToWinLongPath(path);
+    if (!std::filesystem::exists(lp, ec) || ec || !std::filesystem::is_directory(lp, ec)) {
         return false;
     }
-    if (std::filesystem::exists(path / "CMakeCache.txt", ec) ||
-        std::filesystem::exists(path / "build.ninja", ec) ||
-        std::filesystem::exists(path / "CMakeFiles", ec)) {
+    if (fs_util::ExistsLong(path / "CMakeCache.txt") ||
+        fs_util::ExistsLong(path / "build.ninja") ||
+        fs_util::ExistsLong(path / "CMakeFiles")) {
         return true;
     }
     return false;
@@ -203,7 +206,29 @@ std::string Project::ToRelativePathString(const std::filesystem::path& path) con
 }
 
 void Project::SetRootPath(const std::filesystem::path& root) {
-    Load(root);
+    m_file_watcher.Stop();
+    m_abort_scan.store(true);
+    if (m_scan_thread.joinable()) {
+        m_scan_thread.join();
+    }
+    std::error_code ec;
+    std::filesystem::path abs_root = std::filesystem::absolute(root, ec);
+    {
+        std::lock_guard<std::mutex> lock(m_data_mutex);
+        m_root_path = ec ? root : abs_root;
+        m_schema_version = 2;
+        m_loaded_as_v1 = false;
+        m_targets.clear();
+        m_startup_target.clear();
+        if (m_configs.empty()) {
+            ConfigOverrides d; d.base = "debug"; d.defines = {"_DEBUG"};
+            ConfigOverrides r; r.base = "release"; r.defines = {"NDEBUG"};
+            m_configs["Debug"] = std::move(d);
+            m_configs["Release"] = std::move(r);
+        }
+        SyncTargetsLocked();
+    }
+    m_revision++;
 }
 
 void Project::SetCompiler(const std::string& compiler) {
@@ -217,6 +242,7 @@ void Project::SetCompiler(const std::string& compiler) {
         } else {
             m_c_compiler = "gcc";
         }
+        ExpandAllSourceRules(false);
         Save();
     }
 }
@@ -228,11 +254,43 @@ void Project::SetCCompiler(const std::string& c_compiler) {
     }
 }
 
+void Project::SetToolchain(const std::string& toolchain_name, const std::string& fallback_compiler, const std::string& fallback_c_compiler) {
+    bool changed = (m_toolchain != toolchain_name);
+    m_toolchain = toolchain_name;
+    if (!fallback_compiler.empty() && m_compiler != fallback_compiler) {
+        m_compiler = fallback_compiler;
+        changed = true;
+    }
+    if (!fallback_c_compiler.empty() && m_c_compiler != fallback_c_compiler) {
+        m_c_compiler = fallback_c_compiler;
+        changed = true;
+    }
+    if (changed) {
+        ExpandAllSourceRules(false);
+        Save();
+    }
+}
+
+void Project::SetProjectToolchains(const std::vector<ToolchainProfile>& toolchains) {
+    {
+        std::lock_guard<std::mutex> lock(m_data_mutex);
+        m_project_toolchains = toolchains;
+        for (auto& tc : m_project_toolchains) tc.isProjectLocal = true;
+    }
+    Save();
+}
+
 void Project::SetConfiguration(const std::string& config) {
     if (m_configuration != config) {
         m_configuration = config;
+        ExpandAllSourceRules(false);
         Save();
     }
+}
+
+void Project::SetCompileCommandsConfig(const CompileCommandsConfig& cfg) {
+    m_compile_commands_cfg = cfg;
+    Save();
 }
 
 void Project::SetCxxStd(const std::string& std_name) {
@@ -256,6 +314,96 @@ void Project::SetJobs(int jobs) {
     }
 }
 
+void Project::SetToolOverrides(const std::map<std::string, std::string>& overrides) {
+    m_tool_overrides = overrides;
+    Save();
+}
+
+void Project::SetCustomTools(const std::vector<CustomToolSpec>& tools) {
+    m_custom_tools = tools;
+    ExpandAllSourceRules(false);
+    Save();
+}
+
+void Project::SetAsmMode(const std::string& mode) {
+    if (m_asm_mode != mode) {
+        m_asm_mode = mode;
+        Save();
+    }
+}
+
+void Project::SetIgnoreSystemHeaders(bool ignore) {
+    if (m_ignore_system_headers != ignore) {
+        m_ignore_system_headers = ignore;
+        Save();
+    }
+}
+
+void Project::SetKeepDepFiles(bool keep) {
+    if (m_keep_dep_files != keep) {
+        m_keep_dep_files = keep;
+        Save();
+    }
+}
+
+void Project::SetLinker(const std::string& linker) {
+    if (m_linker != linker) {
+        m_linker = linker;
+        Save();
+    }
+}
+
+void Project::SetIncrementalLink(bool inc) {
+    if (m_incremental_link != inc) {
+        m_incremental_link = inc;
+        Save();
+    }
+}
+
+void Project::SetDebugLink(const std::string& mode) {
+    if (m_debug_link != mode) {
+        m_debug_link = mode;
+        Save();
+    }
+}
+
+void Project::SetSplitDwarf(bool split) {
+    if (m_split_dwarf != split) {
+        m_split_dwarf = split;
+        Save();
+    }
+}
+
+void Project::SetMemPerJobMb(int mb) {
+    if (mb < 128) mb = 128;
+    if (m_mem_per_job_mb != mb) {
+        m_mem_per_job_mb = mb;
+        Save();
+    }
+}
+
+void Project::SetLinkJobs(int lj) {
+    if (lj < 1) lj = 1;
+    if (m_link_jobs != lj) {
+        m_link_jobs = lj;
+        Save();
+    }
+}
+
+void Project::SetKeepGoing(bool kg) {
+    if (m_keep_going != kg) {
+        m_keep_going = kg;
+        Save();
+    }
+}
+
+void Project::SetLowPriority(bool lp) {
+    if (m_low_priority != lp) {
+        m_low_priority = lp;
+        Save();
+    }
+}
+
 void Project::SetWarnings(const std::string& warnings) {
     if (m_warnings != warnings) {
         m_warnings = warnings;
@@ -275,6 +423,11 @@ void Project::SetLibDirs(const std::vector<std::string>& dirs) {
 
 void Project::SetLibs(const std::vector<std::string>& libs) {
     m_libs = libs;
+    Save();
+}
+
+void Project::SetLibConditions(const std::map<std::string, std::string>& conds) {
+    m_lib_conditions = conds;
     Save();
 }
 
@@ -555,9 +708,8 @@ void Project::RefreshMissingFilesCache() {
         t.missingFilesSet.clear();
         t.missingFiles.clear();
         for (const auto& file : t.expandedFiles) {
-            std::error_code ec;
             const std::filesystem::path full = ResolvePath(file);
-            if (!std::filesystem::exists(full, ec) || ec) {
+            if (!fs_util::ExistsLong(full)) {
                 t.missingFilesSet.insert(file);
                 t.missingFiles.push_back(file);
                 if (checked.insert(file).second) {
@@ -608,6 +760,58 @@ static void ReadStringArray(const nlohmann::json& json_obj, const char* key, std
     }
 }
 
+static void ReadLibsWithConditions(
+    const nlohmann::json& json_obj,
+    const char* key,
+    std::vector<std::string>& out_libs,
+    std::map<std::string, std::string>& out_conds
+) {
+    out_libs.clear();
+    out_conds.clear();
+    if (json_obj.contains(key) && json_obj[key].is_array()) {
+        for (const auto& item : json_obj[key]) {
+            if (item.is_string()) {
+                out_libs.push_back(item.get<std::string>());
+            } else if (item.is_object()) {
+                std::string name;
+                if (item.contains("name") && item["name"].is_string()) {
+                    name = item["name"].get<std::string>();
+                } else if (item.contains("lib") && item["lib"].is_string()) {
+                    name = item["lib"].get<std::string>();
+                }
+                if (!name.empty()) {
+                    out_libs.push_back(name);
+                    if (item.contains("if") && item["if"].is_string()) {
+                        std::string cond = item["if"].get<std::string>();
+                        if (!cond.empty()) {
+                            out_conds[name] = cond;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static nlohmann::json WriteLibsWithConditions(
+    const std::vector<std::string>& libs,
+    const std::map<std::string, std::string>& conds
+) {
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& lib : libs) {
+        auto it = conds.find(lib);
+        if (it != conds.end() && !it->second.empty()) {
+            nlohmann::json entry = nlohmann::json::object();
+            entry["name"] = lib;
+            entry["if"] = it->second;
+            arr.push_back(std::move(entry));
+        } else {
+            arr.push_back(lib);
+        }
+    }
+    return arr;
+}
+
 static void ReadSettingsBlock(const nlohmann::json& obj, SettingsBlock& blk) {
     if (!obj.is_object()) return;
     ReadStringArray(obj, "includeDirs", blk.includeDirs);
@@ -616,7 +820,7 @@ static void ReadSettingsBlock(const nlohmann::json& obj, SettingsBlock& blk) {
     ReadStringArray(obj, "compileFlags", blk.compileFlags);
     ReadStringArray(obj, "linkFlags", blk.linkFlags);
     ReadStringArray(obj, "libDirs", blk.libDirs);
-    ReadStringArray(obj, "libs", blk.libs);
+    ReadLibsWithConditions(obj, "libs", blk.libs, blk.libConditions);
     ReadStringArray(obj, "copyDlls", blk.copyDlls);
     if (obj.contains("cxxStd") && obj["cxxStd"].is_string()) blk.cxxStd = obj["cxxStd"].get<std::string>();
     if (obj.contains("cStd") && obj["cStd"].is_string()) blk.cStd = obj["cStd"].get<std::string>();
@@ -632,7 +836,7 @@ static nlohmann::json WriteSettingsBlock(const SettingsBlock& blk) {
     if (!blk.compileFlags.empty()) j["compileFlags"] = blk.compileFlags;
     if (!blk.linkFlags.empty()) j["linkFlags"] = blk.linkFlags;
     if (!blk.libDirs.empty()) j["libDirs"] = blk.libDirs;
-    if (!blk.libs.empty()) j["libs"] = blk.libs;
+    if (!blk.libs.empty()) j["libs"] = WriteLibsWithConditions(blk.libs, blk.libConditions);
     if (!blk.copyDlls.empty()) j["copyDlls"] = blk.copyDlls;
     if (!blk.cxxStd.empty()) j["cxxStd"] = blk.cxxStd;
     if (!blk.cStd.empty()) j["cStd"] = blk.cStd;
@@ -775,13 +979,10 @@ void Project::ExpandAllSourceRules(bool mark_dirty_dirs) {
 
     std::vector<TargetRuleInput> inputs;
     std::filesystem::path root_copy;
-    std::string comp_family = "gcc";
+    ConditionContext cond_ctx = BuildConditionContext(*this);
     {
         std::lock_guard<std::mutex> lock(m_data_mutex);
         root_copy = m_root_path;
-        std::string comp_low = ToLower(m_compiler);
-        if (comp_low == "cl" || comp_low == "cl.exe") comp_family = "msvc";
-        else if (comp_low.find("clang") != std::string::npos) comp_family = "clang";
 
         inputs.reserve(m_targets.size());
         for (const auto& t : m_targets) {
@@ -790,14 +991,13 @@ void Project::ExpandAllSourceRules(bool mark_dirty_dirs) {
             in.rules = t.sources;
             in.explicit_files = t.files;
             in.target_excludes = t.exclude;
-#if defined(_WIN32)
-            in.condition_os = "windows";
-#elif defined(__APPLE__)
-            in.condition_os = "macos";
-#else
-            in.condition_os = "linux";
-#endif
-            in.condition_compiler = comp_family;
+            in.target_condition = t.condition;
+            in.condition_ctx = cond_ctx;
+            in.condition_os = cond_ctx.os;
+            in.condition_compiler = cond_ctx.compilerFamily;
+            for (const auto& ct : m_custom_tools) {
+                if (!ct.ext.empty()) in.extra_extensions.push_back(ct.ext);
+            }
             inputs.push_back(std::move(in));
         }
     }
@@ -1168,6 +1368,7 @@ bool Project::Load(const std::filesystem::path& root_path) {
         m_include_dirs.clear();
         m_lib_dirs.clear();
         m_libs.clear();
+        m_lib_conditions.clear();
         m_defines.clear();
         m_copy_dlls.clear();
         m_compile_flags.clear();
@@ -1180,15 +1381,31 @@ bool Project::Load(const std::filesystem::path& root_path) {
             m_configs["Release"] = std::move(r);
         }
         m_schema_warnings.clear();
+        m_tool_overrides.clear();
+        m_custom_tools.clear();
+        m_asm_mode = "auto";
+        m_toolchain.clear();
+        m_project_toolchains.clear();
+        m_compile_commands_cfg = CompileCommandsConfig{};
+        m_ignore_system_headers = true;
+        m_keep_dep_files = false;
+        m_linker = "default";
+        m_incremental_link = true;
+        m_debug_link = "full";
+        m_split_dwarf = false;
+        m_mem_per_job_mb = 2048;
+        m_link_jobs = 1;
+        m_keep_going = false;
+        m_low_priority = true;
         m_output_dir = ".geniebuild/out";
     }
 
     const std::filesystem::path project_file = m_root_path / ".geniebuild" / "project.json";
 
     // If project.json exists, restore it synchronously
-    if (std::filesystem::exists(project_file, ec) && !ec) {
+    if (fs_util::ExistsLong(project_file)) {
         try {
-            std::ifstream file(project_file);
+            std::ifstream file(fs_util::ToWinLongPath(project_file));
             if (file.is_open()) {
                 nlohmann::json j;
                 file >> j;
@@ -1201,7 +1418,28 @@ bool Project::Load(const std::filesystem::path& root_path) {
                     m_schema_version = 1;
                 }
 
-                // Load compiler choice
+                // Load toolchain & compiler choices (V2-14)
+                if (j.contains("toolchain") && j["toolchain"].is_string()) {
+                    m_toolchain = j["toolchain"].get<std::string>();
+                }
+                if (j.contains("compileCommands") && j["compileCommands"].is_object()) {
+                    const auto& ccj = j["compileCommands"];
+                    if (ccj.contains("enabled") && ccj["enabled"].is_boolean()) {
+                        m_compile_commands_cfg.enabled = ccj["enabled"].get<bool>();
+                    }
+                    if (ccj.contains("path") && ccj["path"].is_string()) {
+                        m_compile_commands_cfg.path = ccj["path"].get<std::string>();
+                    }
+                    if (ccj.contains("allConfigs") && ccj["allConfigs"].is_boolean()) {
+                        m_compile_commands_cfg.allConfigs = ccj["allConfigs"].get<bool>();
+                    }
+                }
+                if (j.contains("toolchains") && j["toolchains"].is_array()) {
+                    for (const auto& tcj : j["toolchains"]) {
+                        ToolchainProfile tp = ToolchainManager::ProfileFromJson(tcj, true);
+                        if (!tp.name.empty()) m_project_toolchains.push_back(std::move(tp));
+                    }
+                }
                 if (j.contains("compiler") && j["compiler"].is_string()) {
                     m_compiler = j["compiler"].get<std::string>();
                 }
@@ -1233,6 +1471,53 @@ bool Project::Load(const std::filesystem::path& root_path) {
                     m_jobs = j["jobs"].get<int>();
                 }
 
+                // V2-7 / V2-11 / V2-12 / V2-13 root fields
+                if (j.contains("toolOverrides") && j["toolOverrides"].is_object()) {
+                    for (auto it = j["toolOverrides"].begin(); it != j["toolOverrides"].end(); ++it) {
+                        if (it.value().is_string()) m_tool_overrides[it.key()] = it.value().get<std::string>();
+                    }
+                }
+                if (j.contains("asm") && j["asm"].is_string()) m_asm_mode = j["asm"].get<std::string>();
+                if (j.contains("customTools") && j["customTools"].is_array()) {
+                    for (const auto& ctj : j["customTools"]) {
+                        if (!ctj.is_object()) continue;
+                        CustomToolSpec ct;
+                        if (ctj.contains("ext") && ctj["ext"].is_string()) ct.ext = ctj["ext"].get<std::string>();
+                        if (ctj.contains("program") && ctj["program"].is_string()) ct.program = ctj["program"].get<std::string>();
+                        if (ctj.contains("args") && ctj["args"].is_string()) ct.args = ctj["args"].get<std::string>();
+                        if (ctj.contains("output") && ctj["output"].is_string()) ct.output = ctj["output"].get<std::string>();
+                        if (ctj.contains("link") && ctj["link"].is_boolean()) ct.link = ctj["link"].get<bool>();
+                        if (!ct.ext.empty()) m_custom_tools.push_back(std::move(ct));
+                    }
+                }
+                if (j.contains("ignoreSystemHeaders") && j["ignoreSystemHeaders"].is_boolean()) {
+                    m_ignore_system_headers = j["ignoreSystemHeaders"].get<bool>();
+                }
+                if (j.contains("keepDepFiles") && j["keepDepFiles"].is_boolean()) {
+                    m_keep_dep_files = j["keepDepFiles"].get<bool>();
+                }
+                if (j.contains("linker") && j["linker"].is_string()) m_linker = j["linker"].get<std::string>();
+                if (j.contains("incrementalLink") && j["incrementalLink"].is_boolean()) m_incremental_link = j["incrementalLink"].get<bool>();
+                if (j.contains("debugLink") && j["debugLink"].is_string()) m_debug_link = j["debugLink"].get<std::string>();
+                if (j.contains("splitDwarf") && j["splitDwarf"].is_boolean()) m_split_dwarf = j["splitDwarf"].get<bool>();
+                if (j.contains("memPerJob")) {
+                    if (j["memPerJob"].is_number_integer()) {
+                        m_mem_per_job_mb = std::max(128, j["memPerJob"].get<int>());
+                    } else if (j["memPerJob"].is_string()) {
+                        std::string ms = ToLower(j["memPerJob"].get<std::string>());
+                        try {
+                            if (!ms.empty() && ms.back() == 'g') m_mem_per_job_mb = std::max(128, static_cast<int>(std::stod(ms.substr(0, ms.size() - 1)) * 1024.0));
+                            else if (!ms.empty() && ms.back() == 'm') m_mem_per_job_mb = std::max(128, std::stoi(ms.substr(0, ms.size() - 1)));
+                            else m_mem_per_job_mb = std::max(128, std::stoi(ms));
+                        } catch (...) {}
+                    }
+                }
+                if (j.contains("linkJobs") && j["linkJobs"].is_number_integer()) {
+                    m_link_jobs = std::max(1, j["linkJobs"].get<int>());
+                }
+                if (j.contains("keepGoing") && j["keepGoing"].is_boolean()) m_keep_going = j["keepGoing"].get<bool>();
+                if (j.contains("lowPriority") && j["lowPriority"].is_boolean()) m_low_priority = j["lowPriority"].get<bool>();
+
                 // Warnings
                 if (j.contains("warnings") && j["warnings"].is_string()) {
                     m_warnings = j["warnings"].get<std::string>();
@@ -1240,7 +1525,7 @@ bool Project::Load(const std::filesystem::path& root_path) {
 
                 ReadStringArray(j, "includeDirs", m_include_dirs);
                 ReadStringArray(j, "libDirs", m_lib_dirs);
-                ReadStringArray(j, "libs", m_libs);
+                ReadLibsWithConditions(j, "libs", m_libs, m_lib_conditions);
                 ReadStringArray(j, "defines", m_defines);
                 ReadStringArray(j, "copyDlls", m_copy_dlls);
                 ReadStringArray(j, "compileFlags", m_compile_flags);
@@ -1311,9 +1596,39 @@ bool Project::Load(const std::filesystem::path& root_path) {
                         if (tj.contains("outputName") && tj["outputName"].is_string()) {
                             t.outputName = tj["outputName"].get<std::string>();
                         }
+                        if (tj.contains("if") && tj["if"].is_string()) {
+                            t.condition = tj["if"].get<std::string>();
+                        }
                         if (tj.contains("exportAll") && tj["exportAll"].is_boolean()) {
                             t.exportAll = tj["exportAll"].get<bool>();
                         }
+                        if (tj.contains("freestanding") && tj["freestanding"].is_boolean()) {
+                            t.freestanding = tj["freestanding"].get<bool>();
+                        }
+                        if (tj.contains("linkerScript") && tj["linkerScript"].is_string()) {
+                            t.linkerScript = tj["linkerScript"].get<std::string>();
+                        }
+                        if (tj.contains("entry") && tj["entry"].is_string()) {
+                            t.entry = tj["entry"].get<std::string>();
+                        }
+                        ReadStringArray(tj, "cxxFlags", t.cxxFlags);
+                        if (tj.contains("linkLibgcc") && tj["linkLibgcc"].is_boolean()) {
+                            t.linkLibgcc = tj["linkLibgcc"].get<bool>();
+                        }
+                        auto read_run_cfg = [&](const nlohmann::json& rj, RunConfig& rc) {
+                            if (!rj.is_object()) return;
+                            if (rj.contains("command") && rj["command"].is_string()) rc.command = rj["command"].get<std::string>();
+                            ReadStringArray(rj, "args", rc.args);
+                            if (rj.contains("cwd") && rj["cwd"].is_string()) rc.cwd = rj["cwd"].get<std::string>();
+                            if (rj.contains("env") && rj["env"].is_object()) {
+                                for (auto it = rj["env"].begin(); it != rj["env"].end(); ++it) {
+                                    if (it.value().is_string()) rc.env[it.key()] = it.value().get<std::string>();
+                                }
+                            }
+                            if (rj.contains("buildBeforeRun") && rj["buildBeforeRun"].is_boolean()) rc.buildBeforeRun = rj["buildBeforeRun"].get<bool>();
+                        };
+                        if (tj.contains("run")) read_run_cfg(tj["run"], t.run);
+                        if (tj.contains("debug")) read_run_cfg(tj["debug"], t.debug);
 
                         if (tj.contains("sources") && tj["sources"].is_array()) {
                             for (const auto& sj : tj["sources"]) {
@@ -1394,6 +1709,49 @@ bool Project::Load(const std::filesystem::path& root_path) {
                                 }
                                 t.overrides.push_back(std::move(fov));
                             }
+                        }
+                        if (tj.contains("steps") && tj["steps"].is_array()) {
+                            for (const auto& stj : tj["steps"]) {
+                                if (!stj.is_object()) continue;
+                                BuildStep st;
+                                if (stj.contains("name") && stj["name"].is_string()) st.name = stj["name"].get<std::string>();
+                                if (stj.contains("phase") && stj["phase"].is_string()) st.phase = StepPhaseFromString(stj["phase"].get<std::string>());
+                                if (stj.contains("foreach") && stj["foreach"].is_string()) st.foreachPattern = stj["foreach"].get<std::string>();
+                                if (stj.contains("inputs")) {
+                                    if (stj["inputs"].is_array()) ReadStringArray(stj, "inputs", st.inputs);
+                                    else if (stj["inputs"].is_string()) st.inputs.push_back(stj["inputs"].get<std::string>());
+                                }
+                                if (stj.contains("command") && stj["command"].is_string()) st.command = stj["command"].get<std::string>();
+                                if (stj.contains("outputs")) {
+                                    if (stj["outputs"].is_array()) ReadStringArray(stj, "outputs", st.outputs);
+                                    else if (stj["outputs"].is_string()) {
+                                        std::string s = stj["outputs"].get<std::string>();
+                                        if (!s.empty()) st.outputs.push_back(std::move(s));
+                                    }
+                                }
+                                if (stj.contains("depfile") && stj["depfile"].is_string()) st.depfile = stj["depfile"].get<std::string>();
+                                if (stj.contains("if") && stj["if"].is_string()) st.condition = stj["if"].get<std::string>();
+                                if (stj.contains("generatesSources") && stj["generatesSources"].is_boolean()) st.generatesSources = stj["generatesSources"].get<bool>();
+                                if (stj.contains("shell") && stj["shell"].is_boolean()) st.shell = stj["shell"].get<bool>();
+                                if (stj.contains("always") && stj["always"].is_boolean()) st.always = stj["always"].get<bool>();
+                                t.steps.push_back(std::move(st));
+                            }
+                        }
+                        if (tj.contains("pch") && tj["pch"].is_object()) {
+                            const auto& pj = tj["pch"];
+                            if (pj.contains("header") && pj["header"].is_string()) t.pch.header = pj["header"].get<std::string>();
+                            if (pj.contains("cHeader") && pj["cHeader"].is_string()) t.pch.cHeader = pj["cHeader"].get<std::string>();
+                            if (pj.contains("source") && pj["source"].is_string()) t.pch.source = pj["source"].get<std::string>();
+                            ReadStringArray(pj, "exclude", t.pch.exclude);
+                        }
+                        if (tj.contains("unity") && tj["unity"].is_object()) {
+                            const auto& uj = tj["unity"];
+                            if (uj.contains("enabled") && uj["enabled"].is_boolean()) t.unity.enabled = uj["enabled"].get<bool>();
+                            if (uj.contains("batchSize") && uj["batchSize"].is_number_unsigned()) {
+                                t.unity.batchSize = std::max<size_t>(1, uj["batchSize"].get<size_t>());
+                            }
+                            ReadStringArray(uj, "exclude", t.unity.exclude);
+                            if (uj.contains("adaptive") && uj["adaptive"].is_boolean()) t.unity.adaptive = uj["adaptive"].get<bool>();
                         }
                         m_targets.push_back(std::move(t));
                     }
@@ -1597,7 +1955,7 @@ bool Project::SaveImmediate() const {
     std::lock_guard<std::mutex> lock(m_data_mutex);
     std::error_code ec;
     const std::filesystem::path dir = m_root_path / ".geniebuild";
-    std::filesystem::create_directories(dir, ec);
+    fs_util::CreateDirsLong(dir, ec);
     if (ec) {
         return false;
     }
@@ -1607,14 +1965,24 @@ bool Project::SaveImmediate() const {
     const std::filesystem::path tmp_file = dir / "project.json.tmp";
 
     // Backup v1 file once before first v2 save (§2.4)
-    if (m_loaded_as_v1 && std::filesystem::exists(project_file, ec) && !std::filesystem::exists(v1_backup, ec)) {
-        std::filesystem::copy_file(project_file, v1_backup, std::filesystem::copy_options::skip_existing, ec);
+    if (m_loaded_as_v1 && fs_util::ExistsLong(project_file) && !fs_util::ExistsLong(v1_backup)) {
+        fs_util::CopyFileLong(project_file, v1_backup, ec);
     }
 
     nlohmann::json j;
     j["version"] = 2;
     if (!m_startup_target.empty()) {
         j["startupTarget"] = m_startup_target;
+    }
+    if (!m_toolchain.empty()) {
+        j["toolchain"] = m_toolchain;
+    }
+    if (!m_project_toolchains.empty()) {
+        nlohmann::json tc_arr = nlohmann::json::array();
+        for (const auto& tp : m_project_toolchains) {
+            tc_arr.push_back(ToolchainManager::ProfileToJson(tp));
+        }
+        j["toolchains"] = std::move(tc_arr);
     }
     j["compiler"] = m_compiler;
     j["cCompiler"] = m_c_compiler;
@@ -1623,10 +1991,35 @@ bool Project::SaveImmediate() const {
     j["cxxStd"] = m_cxx_std;
     j["cStd"] = m_c_std;
     j["jobs"] = m_jobs;
+    j["keepGoing"] = m_keep_going;
+    j["lowPriority"] = m_low_priority;
+    j["linkJobs"] = m_link_jobs;
+    if (m_mem_per_job_mb != 2048) j["memPerJob"] = std::to_string(m_mem_per_job_mb) + "M";
+    if (!m_ignore_system_headers) j["ignoreSystemHeaders"] = false;
+    if (m_keep_dep_files) j["keepDepFiles"] = true;
+    if (m_linker != "default") j["linker"] = m_linker;
+    if (!m_incremental_link) j["incrementalLink"] = false;
+    if (m_debug_link != "full") j["debugLink"] = m_debug_link;
+    if (m_split_dwarf) j["splitDwarf"] = true;
+    if (m_asm_mode != "auto") j["asm"] = m_asm_mode;
+    if (!m_tool_overrides.empty()) j["toolOverrides"] = m_tool_overrides;
+    if (!m_custom_tools.empty()) {
+        nlohmann::json ct_arr = nlohmann::json::array();
+        for (const auto& ct : m_custom_tools) {
+            nlohmann::json ctj = nlohmann::json::object();
+            ctj["ext"] = ct.ext;
+            ctj["program"] = ct.program;
+            ctj["args"] = ct.args;
+            ctj["output"] = ct.output;
+            ctj["link"] = ct.link;
+            ct_arr.push_back(std::move(ctj));
+        }
+        j["customTools"] = std::move(ct_arr);
+    }
     j["warnings"] = m_warnings;
     j["includeDirs"] = m_include_dirs;
     j["libDirs"] = m_lib_dirs;
-    j["libs"] = m_libs;
+    j["libs"] = WriteLibsWithConditions(m_libs, m_lib_conditions);
     j["defines"] = m_defines;
     j["copyDlls"] = m_copy_dlls;
     j["compileFlags"] = m_compile_flags;
@@ -1647,6 +2040,13 @@ bool Project::SaveImmediate() const {
     }
     j["configs"] = configs_json;
     j["confirmLargeBuild"] = m_confirm_large_build;
+    if (!m_compile_commands_cfg.enabled || m_compile_commands_cfg.path != "compile_commands.json" || m_compile_commands_cfg.allConfigs) {
+        nlohmann::json ccj = nlohmann::json::object();
+        ccj["enabled"] = m_compile_commands_cfg.enabled;
+        ccj["path"] = m_compile_commands_cfg.path;
+        ccj["allConfigs"] = m_compile_commands_cfg.allConfigs;
+        j["compileCommands"] = std::move(ccj);
+    }
 
     nlohmann::json targets_json = nlohmann::json::array();
     for (const auto& t : m_targets) {
@@ -1654,7 +2054,24 @@ bool Project::SaveImmediate() const {
         tj["name"] = t.name;
         tj["kind"] = TargetKindToString(t.kind);
         if (!t.outputName.empty()) tj["outputName"] = t.outputName;
+        if (!t.condition.empty()) tj["if"] = t.condition;
         if (t.exportAll) tj["exportAll"] = true;
+        if (t.freestanding) tj["freestanding"] = true;
+        if (!t.linkerScript.empty()) tj["linkerScript"] = t.linkerScript;
+        if (!t.entry.empty()) tj["entry"] = t.entry;
+        if (!t.cxxFlags.empty()) tj["cxxFlags"] = t.cxxFlags;
+        if (t.linkLibgcc) tj["linkLibgcc"] = true;
+        auto write_run_cfg = [](const RunConfig& rc) {
+            nlohmann::json rj = nlohmann::json::object();
+            if (!rc.command.empty()) rj["command"] = rc.command;
+            if (!rc.args.empty()) rj["args"] = rc.args;
+            if (!rc.cwd.empty()) rj["cwd"] = rc.cwd;
+            if (!rc.env.empty()) rj["env"] = rc.env;
+            if (!rc.buildBeforeRun) rj["buildBeforeRun"] = false;
+            return rj;
+        };
+        if (!t.run.IsEmpty()) tj["run"] = write_run_cfg(t.run);
+        if (!t.debug.IsEmpty()) tj["debug"] = write_run_cfg(t.debug);
 
         if (!t.sources.empty()) {
             nlohmann::json src_arr = nlohmann::json::array();
@@ -1706,6 +2123,42 @@ bool Project::SaveImmediate() const {
             }
             tj["overrides"] = std::move(ov_arr);
         }
+        if (!t.steps.empty()) {
+            nlohmann::json st_arr = nlohmann::json::array();
+            for (const auto& st : t.steps) {
+                nlohmann::json stj = nlohmann::json::object();
+                stj["name"] = st.name;
+                stj["phase"] = StepPhaseToString(st.phase);
+                if (!st.foreachPattern.empty()) stj["foreach"] = st.foreachPattern;
+                if (!st.inputs.empty()) stj["inputs"] = st.inputs;
+                stj["command"] = st.command;
+                if (st.outputs.size() == 1) stj["outputs"] = st.outputs[0];
+                else if (st.outputs.size() > 1) stj["outputs"] = st.outputs;
+                if (!st.depfile.empty()) stj["depfile"] = st.depfile;
+                if (!st.condition.empty()) stj["if"] = st.condition;
+                if (st.generatesSources) stj["generatesSources"] = true;
+                if (st.shell) stj["shell"] = true;
+                if (st.always) stj["always"] = true;
+                st_arr.push_back(std::move(stj));
+            }
+            tj["steps"] = std::move(st_arr);
+        }
+        if (!t.pch.IsEmpty()) {
+            nlohmann::json pj = nlohmann::json::object();
+            if (!t.pch.header.empty()) pj["header"] = t.pch.header;
+            if (!t.pch.cHeader.empty()) pj["cHeader"] = t.pch.cHeader;
+            if (!t.pch.source.empty()) pj["source"] = t.pch.source;
+            if (!t.pch.exclude.empty()) pj["exclude"] = t.pch.exclude;
+            tj["pch"] = std::move(pj);
+        }
+        if (t.unity.enabled || t.unity.batchSize != 16 || !t.unity.exclude.empty() || !t.unity.adaptive) {
+            nlohmann::json uj = nlohmann::json::object();
+            uj["enabled"] = t.unity.enabled;
+            uj["batchSize"] = t.unity.batchSize;
+            if (!t.unity.exclude.empty()) uj["exclude"] = t.unity.exclude;
+            uj["adaptive"] = t.unity.adaptive;
+            tj["unity"] = std::move(uj);
+        }
         targets_json.push_back(std::move(tj));
     }
     j["targets"] = std::move(targets_json);
@@ -1717,17 +2170,13 @@ bool Project::SaveImmediate() const {
     // Atomic write via temp file + rename to avoid corruption (§2.4 & §5)
     try {
         {
-            std::ofstream file(tmp_file);
+            std::ofstream file(fs_util::ToWinLongPath(tmp_file));
             if (!file.is_open()) return false;
             file << j.dump(2) << std::endl;
         }
         std::error_code rename_ec;
-        std::filesystem::rename(tmp_file, project_file, rename_ec);
-        if (rename_ec) {
-            std::filesystem::copy_file(tmp_file, project_file, std::filesystem::copy_options::overwrite_existing, rename_ec);
-            std::filesystem::remove(tmp_file, rename_ec);
-        }
-        return true;
+        fs_util::RenameReplaceLong(tmp_file, project_file, rename_ec);
+        return !rename_ec;
     } catch (...) {
         return false;
     }

@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <dwmapi.h>
+#include <shobjidl.h>
 #else
 #include <GLFW/glfw3.h>
 #endif
@@ -25,6 +26,8 @@
 #include "core/project.h"
 #include "core/compiler.h"
 #include "core/build_runner.h"
+#include "core/build_steps.h"
+#include "core/run_runner.h"
 
 // UI panel components
 #include "ui/theme.h"
@@ -40,6 +43,9 @@ static core::CompilerManager g_CompilerManager;
 static core::BuildRunner g_BuildRunner;
 static std::vector<core::OutLine> g_OutputLines;
 static std::string g_BuildStartError;
+static core::RunRunner g_RunRunner;
+static std::vector<core::OutLine> g_RunLines;
+static std::string g_RunStartError;
 static float g_PendingDpiScale = -1.0f;
 static float g_DpiScale = 1.0f;
 static GLFWwindow* g_Window = nullptr;
@@ -311,17 +317,36 @@ static void RenderFrame(GLFWwindow* window) {
         }
     }
 
+    // Poll output lines from background Run / Emulator process each frame (V2-16)
+    std::vector<core::OutLine> run_drained = g_RunRunner.DrainOutput();
+    if (!run_drained.empty()) {
+        g_RunLines.insert(g_RunLines.end(), run_drained.begin(), run_drained.end());
+        constexpr size_t MAX_RUN_LINES = 100000;
+        if (g_RunLines.size() > MAX_RUN_LINES) {
+            size_t excess = g_RunLines.size() - MAX_RUN_LINES;
+            g_RunLines.erase(g_RunLines.begin(), g_RunLines.begin() + excess);
+        }
+    }
+
     // Start new ImGui frame
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
-    // Global build shortcuts (Ctrl+B, F5, Ctrl+Shift+B, Ctrl+Shift+T, Ctrl+,, guarded against input text and scanning; Spec §3.5, §3.7, §5)
+    // Global build & run shortcuts (Ctrl+B, F5, Ctrl+Shift+B, Ctrl+Break, Ctrl+R, Ctrl+Shift+T, Ctrl+,)
     bool ctrl_shift_b = (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_B));
     bool ctrl_shift_t = (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_T));
+    bool ctrl_break = (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Pause));
     bool ctrl_b = (io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_B));
+    bool ctrl_r = (io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_R));
     bool ctrl_comma = (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Comma));
     bool f5 = ImGui::IsKeyPressed(ImGuiKey_F5);
+
+    ui::SetActiveRunRunner(&g_RunRunner);
+
+    if (ctrl_break && g_BuildRunner.IsRunning()) {
+        g_BuildRunner.CancelBuild();
+    }
 
     if (ctrl_comma && !io.WantTextInput) {
         ui::OpenBuildSettingsModal();
@@ -330,7 +355,17 @@ static void RenderFrame(GLFWwindow* window) {
         ui::OpenNewTargetWizard();
     }
 
-    if (ctrl_shift_b && !g_BuildRunner.IsRunning() && !io.WantTextInput && !g_Project.IsScanning()) {
+    if (ctrl_r && !io.WantTextInput && g_Project.HasProject() && !g_Project.IsScanning()) {
+        if (g_RunRunner.IsRunning()) {
+            g_RunRunner.Stop();
+        } else if (!g_BuildRunner.IsRunning()) {
+            ui::TriggerRunWithGuard(
+                g_Project, g_CompilerManager, g_BuildRunner,
+                g_BuildStartError, g_OutputLines,
+                g_RunRunner, g_RunLines, g_RunStartError, false
+            );
+        }
+    } else if (ctrl_shift_b && !g_BuildRunner.IsRunning() && !io.WantTextInput && !g_Project.IsScanning()) {
         if (!g_Project.GetFiles().empty() && !g_Project.HasMissingFiles() && g_CompilerManager.HasCompilers()) {
             ui::TriggerRebuildWithGuard(g_Project, g_CompilerManager, g_BuildRunner, g_BuildStartError, g_OutputLines);
         }
@@ -379,7 +414,11 @@ static void RenderFrame(GLFWwindow* window) {
 
         // 2. Top Bar 2: Dedicated Action & Workflow Toolbar
         ImGui::SetCursorPos(ImVec2(ui::Theme::Sp::S3, toolbar_top_y + (ui::Theme::ToolBarHeight - ui::Theme::Btn::DefaultH) * 0.5f));
-        ui::RenderToolBar(window, g_Project, g_CompilerManager, g_BuildRunner, g_BuildStartError, g_OutputLines);
+        ui::RenderToolBar(
+            window, g_Project, g_CompilerManager, g_BuildRunner,
+            g_BuildStartError, g_OutputLines,
+            &g_RunRunner, &g_RunLines, &g_RunStartError
+        );
 
         // Faint 1px divider below Toolbar
         ImGui::SetCursorPos(ImVec2(0.0f, toolbar_bottom_y));
@@ -515,7 +554,10 @@ static void RenderFrame(GLFWwindow* window) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
         ImGui::BeginChild("Pane2Container", ImVec2(s_PaneW2, panes_height), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         ImGui::PopStyleColor();
-        ui::RenderOutputPanel(g_CompilerManager, g_BuildRunner, g_OutputLines, g_BuildStartError);
+        ui::RenderOutputPanel(
+            g_CompilerManager, g_BuildRunner, g_OutputLines, g_BuildStartError,
+            &g_RunRunner, &g_RunLines, &g_RunStartError, &g_Project
+        );
         ImGui::EndChild();
 
         // Save pane widths as normalized ratios (0-1) in project.json on drag release (Spec §1.6)
@@ -531,6 +573,48 @@ static void RenderFrame(GLFWwindow* window) {
 
 #if defined(_WIN32)
     HWND hwnd = glfwGetWin32Window(window);
+    // V2-20 Windows Taskbar Progress (ITaskbarList3) & unfocused completion FlashWindowEx
+    {
+        static ITaskbarList3* s_Taskbar = nullptr;
+        static bool s_TaskbarTried = false;
+        static bool s_WasBuildingPrev = false;
+        if (!s_TaskbarTried) {
+            s_TaskbarTried = true;
+            ITaskbarList3* tb = nullptr;
+            if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&tb))) && tb) {
+                if (SUCCEEDED(tb->HrInit())) {
+                    s_Taskbar = tb;
+                } else {
+                    tb->Release();
+                }
+            }
+        }
+        bool is_bld = g_BuildRunner.IsRunning();
+        if (s_Taskbar) {
+            if (is_bld) {
+                core::BuildProgress bp = g_BuildRunner.GetProgress();
+                if (bp.totalJobs > 0) {
+                    s_Taskbar->SetProgressState(hwnd, TBPF_NORMAL);
+                    s_Taskbar->SetProgressValue(hwnd, bp.completedJobs, bp.totalJobs);
+                } else {
+                    s_Taskbar->SetProgressState(hwnd, TBPF_INDETERMINATE);
+                }
+            } else if (s_WasBuildingPrev) {
+                s_Taskbar->SetProgressState(hwnd, TBPF_NOPROGRESS);
+            }
+        }
+        if (s_WasBuildingPrev && !is_bld) {
+            if (GetForegroundWindow() != hwnd) {
+                FLASHWINFO fw{};
+                fw.cbSize = sizeof(fw);
+                fw.hwnd = hwnd;
+                fw.dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG;
+                fw.uCount = 3;
+                FlashWindowEx(&fw);
+            }
+        }
+        s_WasBuildingPrev = is_bld;
+    }
     // 1px Col::Border outline around non-maximized window for visible contrast on dark desktop backgrounds (Spec §1.5 & §6.3 U11)
     if (!IsZoomed(hwnd)) {
         ImGui::GetForegroundDrawList()->AddRect(
@@ -558,19 +642,25 @@ static void RenderFrame(GLFWwindow* window) {
 }
 
 int main(int argc, char* argv[]) {
-    // Headless CLI mode (§0.4): geniebuild --build [--target T] [--config C] <path>
+    // Headless CLI mode (§0.4): geniebuild --build [--target T] [--config C] [--toolchain N] [--trust] <path>
     bool cli_build = false;
+    bool cli_trust = false;
     std::string cli_target;
     std::string cli_config;
+    std::string cli_toolchain;
     std::filesystem::path cli_project_path;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i] ? argv[i] : "";
         if (arg == "--build") {
             cli_build = true;
+        } else if (arg == "--trust") {
+            cli_trust = true;
         } else if (arg == "--target" && i + 1 < argc) {
             cli_target = argv[++i];
         } else if (arg == "--config" && i + 1 < argc) {
             cli_config = argv[++i];
+        } else if (arg == "--toolchain" && i + 1 < argc) {
+            cli_toolchain = argv[++i];
         } else if (!arg.empty() && arg[0] != '-') {
             std::error_code ec;
             std::filesystem::path p = std::filesystem::absolute(std::filesystem::u8path(arg), ec);
@@ -594,6 +684,12 @@ int main(int argc, char* argv[]) {
         proj.Update();
         if (!cli_config.empty()) {
             proj.SetConfiguration(cli_config);
+        }
+        if (!cli_toolchain.empty()) {
+            proj.SetToolchain(cli_toolchain);
+        }
+        if (cli_trust) {
+            core::TrustStore::SetTrusted(cli_project_path, true);
         }
         core::CompilerManager cm;
         core::BuildRunner runner;
@@ -719,7 +815,7 @@ int main(int argc, char* argv[]) {
         // Event processing (§2.6): Poll continuously during input and 500ms after, or during
         // active build/scan/indexing to keep 60 FPS locked to vsync. When completely idle,
         // sleep up to 250ms via glfwWaitEventsTimeout() to drop CPU usage well below 1%.
-        bool has_background_work = g_BuildRunner.IsRunning() || g_Project.IsScanning() || ui::IsFileTreeIndexing();
+        bool has_background_work = g_BuildRunner.IsRunning() || g_RunRunner.IsRunning() || g_Project.IsScanning() || ui::IsFileTreeIndexing();
         bool has_user_input = (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f ||
                                io.MouseWheel != 0.0f || io.MouseWheelH != 0.0f ||
                                io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2] ||
@@ -749,6 +845,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup resources
+    g_RunRunner.Stop();
     if (g_BuildRunner.IsRunning()) {
         std::cout << "Waiting for active compiler process to finish before shutdown...\n";
     }

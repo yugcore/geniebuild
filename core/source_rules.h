@@ -1,5 +1,6 @@
 #pragma once
 
+#include "condition.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -105,8 +106,11 @@ struct TargetRuleInput {
     std::vector<SourceRule> rules;
     std::vector<std::string> explicit_files;
     std::vector<std::string> target_excludes;
-    std::string condition_os;       // "windows" | "linux" | "macos"
-    std::string condition_compiler; // "msvc" | "gcc" | "clang"
+    std::string target_condition;   // optional target-level "if" expression (V2-5)
+    ConditionContext condition_ctx; // full evaluation context (V2-5)
+    std::string condition_os;       // legacy fallback
+    std::string condition_compiler; // legacy fallback
+    std::vector<std::string> extra_extensions; // custom tool extensions (V2-7)
 };
 
 struct TargetRuleOutput {
@@ -143,6 +147,13 @@ bool IsHeaderExtension(const std::string& ext_lower);
 RuleExpansionResult ExpandRules(
     const std::filesystem::path& root,
     const std::vector<TargetRuleInput>& targets,
+    DirectoryCache& cache
+);
+
+// Expands an arbitrary file glob pattern (used by V2-6 step inputs/foreach)
+std::vector<std::string> ExpandGlobFiles(
+    const std::filesystem::path& root,
+    const std::string& pattern,
     DirectoryCache& cache
 );
 

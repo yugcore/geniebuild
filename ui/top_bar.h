@@ -3,6 +3,7 @@
 #include "project.h"
 #include "compiler.h"
 #include "build_runner.h"
+#include "run_runner.h"
 #include <vector>
 #include <string>
 
@@ -33,24 +34,46 @@ void RenderTitleBar(
     const core::Project& project
 );
 
-// Renders the dedicated action toolbar (40px): Open Folder, Settings, Output path, Debug/Release, Compiler, Build, FPS
+// Renders the dedicated action toolbar (40px): Open Folder, Settings, Output path, Debug/Release, Toolchain, Build, Run, FPS
 void RenderToolBar(
     GLFWwindow* window,
     core::Project& project,
-    const core::CompilerManager& compiler_manager,
+    core::CompilerManager& compiler_manager,
     core::BuildRunner& build_runner,
     std::string& build_start_error,
-    std::vector<core::OutLine>& output_lines
+    std::vector<core::OutLine>& output_lines,
+    core::RunRunner* run_runner = nullptr,
+    std::vector<core::OutLine>* run_lines = nullptr,
+    std::string* run_start_error = nullptr
 );
 
 // Renders the integrated custom title bar (backward compatibility wrapper)
 void RenderTopBar(
     GLFWwindow* window,
     core::Project& project,
-    const core::CompilerManager& compiler_manager,
+    core::CompilerManager& compiler_manager,
     core::BuildRunner& build_runner,
     std::string& build_start_error,
-    std::vector<core::OutLine>& output_lines
+    std::vector<core::OutLine>& output_lines,
+    core::RunRunner* run_runner = nullptr,
+    std::vector<core::OutLine>* run_lines = nullptr,
+    std::string* run_start_error = nullptr
+);
+
+// Associates an active RunRunner so TriggerBuildWithGuard/TriggerRebuildWithGuard can stop conflicting Windows executables
+void SetActiveRunRunner(core::RunRunner* run_runner);
+
+// Triggers Run (or Debug) with buildBeforeRun / trust checks (V2-16)
+void TriggerRunWithGuard(
+    core::Project& project,
+    core::CompilerManager& compiler_manager,
+    core::BuildRunner& build_runner,
+    std::string& build_start_error,
+    std::vector<core::OutLine>& output_lines,
+    core::RunRunner& run_runner,
+    std::vector<core::OutLine>& run_lines,
+    std::string& run_start_error,
+    bool is_debug = false
 );
 
 // Triggers build or opens large-build confirmation modal if files > 500 (Spec §3.7)

@@ -1,6 +1,12 @@
 #include "build_list_panel.h"
 #include "build_settings_modal.h"
 #include "source_rules.h"
+#include "tool_registry.h"
+#include "pch.h"
+#include "unity.h"
+#include "settings_resolver.h"
+#include "condition.h"
+#include "build_steps.h"
 #include "top_bar.h"
 #include "theme.h"
 #include "icons.h"
@@ -50,6 +56,8 @@ struct BuildTreeNode {
     bool is_c_source = false;
     bool is_missing = false;
     bool is_enabled = true;
+    std::string type_badge;
+    ImU32 type_badge_color = 0;
     int total_files = 0;
     int missing_files = 0;
     int enabled_files = 0;
@@ -128,6 +136,14 @@ public:
                 ext = ToLower(fname.substr(dot_pos));
             }
             file_node.is_c_source = (ext == ".c");
+            {
+                TreeRow tmp;
+                tmp.type = TreeRowType::SourceFile;
+                tmp.rel_path = norm;
+                PopulateTreeRowTypeBadge(tmp, project.GetCustomTools());
+                file_node.type_badge = std::move(tmp.type_badge);
+                file_node.type_badge_color = tmp.type_badge_color;
+            }
             if (target) {
                 file_node.is_missing = (target->missingFilesSet.find(norm) != target->missingFilesSet.end());
                 file_node.is_enabled = target->IsFileEnabled(norm);
@@ -409,6 +425,8 @@ static void FlattenBuildTree(
         row.type = TreeRowType::SourceFile;
         row.show_checkbox = true;
         row.is_c = node.is_c_source;
+        row.type_badge = node.type_badge;
+        row.type_badge_color = node.type_badge_color;
         row.is_missing = node.is_missing;
         row.check_state = node.is_enabled ? 1 : 0;
         row.is_disabled = !node.is_enabled;
@@ -423,8 +441,7 @@ static void CollectAllSources(const std::filesystem::path& root_path, std::vecto
     std::filesystem::recursive_directory_iterator end;
 
     auto is_source_file = [](const std::filesystem::path& p) {
-        std::string ext = ToLower(p.extension().generic_u8string());
-        return (ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".cxx");
+        return core::ToolRegistry::ClassifySourceFile(p.generic_u8string()) != core::SourceFileKind::Unknown;
     };
 
     while (it != end && !ec) {
@@ -489,26 +506,84 @@ static void RenderTargetsTree(
     const float dpi = Theme::DpiScale;
     const auto& targets = project.GetTargets();
     auto multi_target_files = project.GetMultiTargetFilesCopy();
+    const core::ConditionContext cond_ctx = core::BuildConditionContext(project);
 
-    std::string comp_low = ToLower(project.GetCompiler());
-    std::string comp_family = "gcc";
-    if (comp_low == "cl" || comp_low == "cl.exe") comp_family = "msvc";
-    else if (comp_low.find("clang") != std::string::npos) comp_family = "clang";
-#if defined(_WIN32)
-    const std::string os_name = "windows";
-#elif defined(__APPLE__)
-    const std::string os_name = "macos";
-#else
-    const std::string os_name = "linux";
-#endif
-
-    // Rebuild per-target folder trees on project revision change
+    // Rebuild per-target folder trees, step input counts, PCH analysis & Unity plan on project revision change
     static uint64_t s_LastTargetsTreeRev = (uint64_t)-1;
+    static std::unordered_map<std::string, std::vector<size_t>> s_StepInputCounts;
+    static std::unordered_map<std::string, core::TargetPchAnalysis> s_PchAnalyses;
+    static std::unordered_map<std::string, core::UnityPlan> s_UnityPlans;
     if (project.Revision() != s_LastTargetsTreeRev) {
         s_LastTargetsTreeRev = project.Revision();
         s_TargetTrees.clear();
+        s_StepInputCounts.clear();
+        s_PchAnalyses.clear();
+        s_UnityPlans.clear();
+
+        const core::CompilerInfo* base_comp = compiler_manager.FindCompiler(project.GetCompiler());
+        if (!base_comp && !compiler_manager.GetDetectedCompilers().empty()) {
+            base_comp = &compiler_manager.GetDetectedCompilers().front();
+        }
+
         for (const auto& t : targets) {
             s_TargetTrees[t.name].RebuildFromTarget(project, &t);
+            std::vector<size_t> counts;
+            counts.reserve(t.steps.size());
+            for (const auto& st : t.steps) {
+                if (!st.foreachPattern.empty()) {
+                    counts.push_back(core::ExpandGlobFiles(project.GetRootPath(), st.foreachPattern, project.GetDirectoryCache()).size());
+                } else {
+                    size_t c = 0;
+                    for (const auto& ip : st.inputs) {
+                        if (ip.find('*') != std::string::npos || ip.find('?') != std::string::npos || ip.find('{') != std::string::npos) {
+                            c += core::ExpandGlobFiles(project.GetRootPath(), ip, project.GetDirectoryCache()).size();
+                        } else if (!ip.empty()) {
+                            c += 1;
+                        }
+                    }
+                    counts.push_back(c);
+                }
+            }
+            s_StepInputCounts[t.name] = std::move(counts);
+
+            if ((!t.pch.IsEmpty() || t.unity.enabled) && base_comp) {
+                const bool is_msvc = (base_comp->name == "cl");
+                const bool is_clang = (base_comp->name.find("clang") != std::string::npos);
+                std::unordered_map<std::string, const core::Target*> tmap;
+                for (const auto& tg : targets) tmap[tg.name] = &tg;
+                core::EffectiveTargetSettings eff_tgt = core::ResolveEffectiveTargetSettings(project, t, tmap, project.GetConfiguration(), is_msvc);
+
+                std::vector<std::string> compiled_srcs;
+                std::unordered_map<std::string, std::shared_ptr<const core::EffectiveFileSettings>> file_effs;
+                for (const auto& sf : t.expandedFiles) {
+                    if (!t.IsFileEnabled(sf)) continue;
+                    compiled_srcs.push_back(sf);
+                    file_effs[sf] = std::make_shared<const core::EffectiveFileSettings>(
+                        core::ResolveFileSettings(project, t, eff_tgt, sf, project.GetConfiguration(), project.GetCompiler(), false)
+                    );
+                }
+
+                core::TargetPchAnalysis pch_an;
+                if (!t.pch.IsEmpty()) {
+                    pch_an = core::PchManager::AnalyzeAndPlanTargetPch(
+                        project, t, eff_tgt, compiled_srcs, file_effs,
+                        *base_comp, *base_comp, project.GetConfiguration(),
+                        is_msvc, is_clang, false, false
+                    );
+                    s_PchAnalyses[t.name] = pch_an;
+                }
+
+                if (t.unity.enabled) {
+                    std::unordered_map<std::string, bool> uses_pch_map;
+                    for (const auto& fu : pch_an.fileUsages) {
+                        uses_pch_map[fu.file] = fu.usesPch;
+                    }
+                    s_UnityPlans[t.name] = core::UnityManager::PlanTargetUnity(
+                        project, t, compiled_srcs, file_effs, uses_pch_map,
+                        project.GetConfiguration(), base_comp->name, is_msvc, nullptr, false
+                    );
+                }
+            }
         }
     }
 
@@ -517,6 +592,7 @@ static void RenderTargetsTree(
 
     for (const auto& t : targets) {
         ImGui::PushID(("tgt_" + t.name).c_str());
+        core::ConditionEvalResult tgt_cond = core::EvaluateCondition(t.condition, cond_ctx);
 
         bool is_open = (s_CollapsedTargets.find(t.name) == s_CollapsedTargets.end());
         if (!s_DebouncedFilterText.empty()) is_open = true;
@@ -576,8 +652,17 @@ static void RenderTargetsTree(
             cx += 9.0f * dpi;
         }
 
-        dl->AddText(ImVec2(cx, mid_text_y), ImGui::ColorConvertFloat4ToU32(Theme::Col::Text), t.name.c_str());
+        dl->AddText(ImVec2(cx, mid_text_y), ImGui::ColorConvertFloat4ToU32(tgt_cond.active ? Theme::Col::Text : Theme::Col::Inactive), t.name.c_str());
         cx += ImGui::CalcTextSize(t.name.c_str()).x + 8.0f * dpi;
+
+        if (!t.condition.empty()) {
+            std::string ctag = "[if " + t.condition + "]";
+            ImGui::PushFont(g_Fonts.secondary);
+            ImVec4 ccol = !tgt_cond.valid ? Theme::Col::Error : (tgt_cond.active ? Theme::Col::TextDim : Theme::Col::Inactive);
+            dl->AddText(ImVec2(cx, mid_text_y), ImGui::ColorConvertFloat4ToU32(ccol), ctag.c_str());
+            cx += ImGui::CalcTextSize(ctag.c_str()).x + 8.0f * dpi;
+            ImGui::PopFont();
+        }
 
         const char* kind_short = (t.kind == core::TargetKind::Executable) ? "exe"
             : (t.kind == core::TargetKind::Static) ? "static"
@@ -586,13 +671,35 @@ static void RenderTargetsTree(
         if (!t.missingFiles.empty()) {
             meta += " (" + std::to_string(t.missingFiles.size()) + " missing)";
         }
+        auto u_it = s_UnityPlans.find(t.name);
+        if (t.unity.enabled && u_it != s_UnityPlans.end()) {
+            meta += " · unity " + std::to_string(u_it->second.totalBatchCount) + " batches";
+        }
         ImGui::PushFont(g_Fonts.secondary);
         dl->AddText(
             ImVec2(cx, mid_text_y),
-            ImGui::ColorConvertFloat4ToU32(t.missingFiles.empty() ? Theme::Col::TextDim : Theme::Col::Error),
+            ImGui::ColorConvertFloat4ToU32(!t.missingFiles.empty() ? Theme::Col::Error : (tgt_cond.active ? Theme::Col::TextDim : Theme::Col::Inactive)),
             meta.c_str()
         );
         ImGui::PopFont();
+
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            std::string tip = core::ToolRegistry::FormatTypeBreakdown(t.expandedFiles, project.GetCustomTools());
+            if (!tgt_cond.active && !tgt_cond.reason.empty()) {
+                tip = tgt_cond.reason + (tip.empty() ? "" : "\n" + tip);
+            }
+            if (t.unity.enabled && u_it != s_UnityPlans.end()) {
+                if (!tip.empty()) tip += "\n";
+                tip += "Unity: " + std::to_string(u_it->second.batches.size()) + " batches, " +
+                       std::to_string(u_it->second.standaloneFiles.size()) + " standalone";
+                if (!u_it->second.hotFiles.empty()) {
+                    tip += " (" + std::to_string(u_it->second.hotFiles.size()) + " hot isolated)";
+                }
+            }
+            if (!tip.empty()) {
+                Theme::Tooltip(tip.c_str());
+            }
+        }
 
         ImGui::SetCursorPos(next_pos);
 
@@ -623,6 +730,9 @@ static void RenderTargetsTree(
             }
             if (ImGui::MenuItem("Target settings...")) {
                 OpenBuildSettingsModal(t.name);
+            }
+            if (ImGui::MenuItem("Add build step...")) {
+                OpenBuildSettingsForSteps(t.name, -1);
             }
             if (ImGui::MenuItem("Add source rule...")) {
                 core::SourceRule nr;
@@ -676,7 +786,8 @@ static void RenderTargetsTree(
             for (size_t ri = 0; ri < t.sources.size(); ++ri) {
                 const auto& rule = t.sources[ri];
                 size_t match_cnt = (ri < t.ruleMatchCounts.size()) ? t.ruleMatchCounts[ri] : 0;
-                bool active = rule.condition.empty() || core::EvaluateSimpleCondition(rule.condition, os_name, comp_family);
+                core::ConditionEvalResult r_cond = core::EvaluateCondition(rule.condition, cond_ctx);
+                bool active = tgt_cond.active && r_cond.active;
 
                 ImGui::PushID(static_cast<int>(ri));
                 ImVec2 rpos = ImGui::GetCursorScreenPos();
@@ -692,7 +803,7 @@ static void RenderTargetsTree(
                 float rtext_y = rpos.y + (rh - ImGui::GetTextLineHeight()) * 0.5f;
                 ImVec4 txt_col = active ? Theme::Col::Text : Theme::Col::Inactive;
 
-                dl->AddText(ImVec2(rx, rtext_y), ImGui::ColorConvertFloat4ToU32(Theme::Col::Accent), ICON_FA_COPY);
+                dl->AddText(ImVec2(rx, rtext_y), ImGui::ColorConvertFloat4ToU32(active ? Theme::Col::Accent : Theme::Col::Inactive), ICON_FA_COPY);
                 rx += 16.0f * dpi;
                 dl->AddText(ImVec2(rx, rtext_y), ImGui::ColorConvertFloat4ToU32(txt_col), rule.include.c_str());
                 rx += ImGui::CalcTextSize(rule.include.c_str()).x + 8.0f * dpi;
@@ -700,20 +811,24 @@ static void RenderTargetsTree(
                 if (!rule.condition.empty()) {
                     std::string ctag = "[if " + rule.condition + "]";
                     ImGui::PushFont(g_Fonts.secondary);
-                    dl->AddText(ImVec2(rx, rtext_y), ImGui::ColorConvertFloat4ToU32(active ? Theme::Col::TextDim : Theme::Col::Inactive), ctag.c_str());
+                    ImVec4 ccol = !r_cond.valid ? Theme::Col::Error : (active ? Theme::Col::TextDim : Theme::Col::Inactive);
+                    dl->AddText(ImVec2(rx, rtext_y), ImGui::ColorConvertFloat4ToU32(ccol), ctag.c_str());
                     rx += ImGui::CalcTextSize(ctag.c_str()).x + 8.0f * dpi;
                     ImGui::PopFont();
                 }
 
                 std::string cnt_s = std::to_string(match_cnt);
-                ImVec4 cnt_col = (match_cnt == 0 && active) ? Theme::Col::Warning : Theme::Col::TextDim;
+                ImVec4 cnt_col = (match_cnt == 0 && active) ? Theme::Col::Warning : (active ? Theme::Col::TextDim : Theme::Col::Inactive);
                 ImGui::PushFont(g_Fonts.secondary);
                 dl->AddText(ImVec2(rx, rtext_y), ImGui::ColorConvertFloat4ToU32(cnt_col), cnt_s.c_str());
                 ImGui::PopFont();
 
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                    if (!active) {
-                        std::string tip = "Inactive rule (condition '" + rule.condition + "' is false)\nDouble-click to edit";
+                    if (!r_cond.valid) {
+                        std::string tip = "Invalid condition: " + r_cond.error + "\nDouble-click to edit";
+                        Theme::Tooltip(tip.c_str());
+                    } else if (!active) {
+                        std::string tip = (!tgt_cond.active ? tgt_cond.reason : r_cond.reason) + "\nDouble-click to edit";
                         Theme::Tooltip(tip.c_str());
                     } else if (match_cnt == 0) {
                         Theme::Tooltip("Rule matches no files\nDouble-click to edit");
@@ -745,6 +860,124 @@ static void RenderTargetsTree(
                     ImGui::PopFont();
                 }
 
+                ImGui::PopID();
+            }
+
+            // 2b. Pre-build / Post-build step rows (V2-6)
+            for (size_t si = 0; si < t.steps.size(); ++si) {
+                const auto& st = t.steps[si];
+                core::ConditionEvalResult st_cond = core::EvaluateCondition(st.condition, cond_ctx);
+                bool st_active = tgt_cond.active && st_cond.active;
+
+                ImGui::PushID(("step_" + std::to_string(si)).c_str());
+                ImVec2 spos = ImGui::GetCursorScreenPos();
+                float sh = Theme::RowHeight;
+                bool sclicked = ImGui::Selectable("##step_row", false, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(0, sh));
+                ImVec2 snext = ImGui::GetCursorPos();
+
+                if (sclicked && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    OpenBuildSettingsForSteps(t.name, static_cast<int>(si));
+                }
+
+                float sx = spos.x + sub_indent;
+                float stext_y = spos.y + (sh - ImGui::GetTextLineHeight()) * 0.5f;
+                ImVec4 st_col = st_active ? Theme::Col::Text : Theme::Col::Inactive;
+
+                dl->AddText(ImVec2(sx, stext_y), ImGui::ColorConvertFloat4ToU32(st_active ? Theme::Col::Warning : Theme::Col::Inactive), ICON_FA_GEAR);
+                sx += 16.0f * dpi;
+
+                std::string sname = st.name.empty() ? "(unnamed step)" : st.name;
+                dl->AddText(ImVec2(sx, stext_y), ImGui::ColorConvertFloat4ToU32(st_col), sname.c_str());
+                sx += ImGui::CalcTextSize(sname.c_str()).x + 8.0f * dpi;
+
+                std::string smeta = (st.phase == core::StepPhase::PostBuild) ? "post" : "pre";
+                size_t in_cnt = 0;
+                auto cnt_it = s_StepInputCounts.find(t.name);
+                if (cnt_it != s_StepInputCounts.end() && si < cnt_it->second.size()) {
+                    in_cnt = cnt_it->second[si];
+                }
+                if (st.always) {
+                    smeta += "  always";
+                } else if (!st.foreachPattern.empty() || !st.inputs.empty()) {
+                    smeta += "  " + std::to_string(in_cnt) + (in_cnt == 1 ? " input" : " inputs");
+                }
+                ImGui::PushFont(g_Fonts.secondary);
+                dl->AddText(ImVec2(sx, stext_y), ImGui::ColorConvertFloat4ToU32(st_active ? Theme::Col::TextDim : Theme::Col::Inactive), smeta.c_str());
+                sx += ImGui::CalcTextSize(smeta.c_str()).x + 8.0f * dpi;
+
+                if (!st.condition.empty()) {
+                    std::string ctag = "[if " + st.condition + "]";
+                    ImVec4 ccol = !st_cond.valid ? Theme::Col::Error : (st_active ? Theme::Col::TextDim : Theme::Col::Inactive);
+                    dl->AddText(ImVec2(sx, stext_y), ImGui::ColorConvertFloat4ToU32(ccol), ctag.c_str());
+                }
+                ImGui::PopFont();
+
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                    std::string tip = "Step: " + sname + " (" + core::StepPhaseToString(st.phase) + ")\n" + st.command;
+                    if (!st_cond.valid) tip = "Invalid condition: " + st_cond.error + "\n" + tip;
+                    else if (!st_active) tip = (!tgt_cond.active ? tgt_cond.reason : st_cond.reason) + "\n" + tip;
+                    tip += "\nDouble-click to edit in Settings";
+                    Theme::Tooltip(tip.c_str());
+                }
+
+                ImGui::SetCursorPos(snext);
+
+                if (ImGui::BeginPopupContextItem("##step_ctx")) {
+                    if (ImGui::MenuItem("Edit step...")) {
+                        OpenBuildSettingsForSteps(t.name, static_cast<int>(si));
+                    }
+                    if (ImGui::MenuItem("Remove step")) {
+                        core::Target copy = t;
+                        copy.steps.erase(copy.steps.begin() + static_cast<ptrdiff_t>(si));
+                        project.UpdateTarget(copy);
+                    }
+                    ImGui::EndPopup();
+                }
+
+                ImGui::PopID();
+            }
+
+            // 2c. PCH status sub-row (V2-8)
+            if (!t.pch.IsEmpty()) {
+                auto p_it = s_PchAnalyses.find(t.name);
+                std::string hdr_lbl = !t.pch.header.empty() ? t.pch.header : t.pch.cHeader;
+                std::string pch_lbl = "PCH " + hdr_lbl;
+                if (p_it != s_PchAnalyses.end()) {
+                    pch_lbl += " · " + std::to_string(p_it->second.includedCount) + "/" +
+                               std::to_string(p_it->second.totalCount) + " files";
+                }
+                ImGui::PushID("pch_row");
+                ImVec2 ppos = ImGui::GetCursorScreenPos();
+                float ph = Theme::RowHeight;
+                if (ImGui::Selectable("##pch_sel", false, 0, ImVec2(0, ph))) {
+                    OpenBuildSettingsForPch(t.name);
+                }
+                ImVec2 pnext = ImGui::GetCursorPos();
+                float px = ppos.x + sub_indent;
+                float ptext_y = ppos.y + (ph - ImGui::GetTextLineHeight()) * 0.5f;
+                dl->AddText(ImVec2(px, ptext_y), ImGui::ColorConvertFloat4ToU32(Theme::Col::Accent), ICON_FA_CODE);
+                px += 16.0f * dpi;
+                ImGui::PushFont(g_Fonts.secondary);
+                dl->AddText(ImVec2(px, ptext_y), ImGui::ColorConvertFloat4ToU32(Theme::Col::TextDim), pch_lbl.c_str());
+                ImGui::PopFont();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                    std::string ptip = "Precompiled Header: " + hdr_lbl + "\nClick to configure PCH settings";
+                    if (p_it != s_PchAnalyses.end()) {
+                        std::vector<std::string> excl_lines;
+                        for (const auto& fu : p_it->second.fileUsages) {
+                            if (!fu.usesPch && !fu.excludeReason.empty()) {
+                                excl_lines.push_back("  " + fu.file + " (" + fu.excludeReason + ")");
+                                if (excl_lines.size() >= 10) break;
+                            }
+                        }
+                        if (!excl_lines.empty()) {
+                            ptip += "\n\nExcluded files:";
+                            for (const auto& el : excl_lines) ptip += "\n" + el;
+                        }
+                    }
+                    Theme::Tooltip(ptip.c_str());
+                }
+                ImGui::SetCursorPos(pnext);
                 ImGui::PopID();
             }
 
@@ -1216,17 +1449,25 @@ void RenderBuildListPanel(
         if (s_ShowNewTargetWizard) ImGui::OpenPopup("New Target Wizard##Modal");
         bool wiz_close_x = false;
         if (Theme::BeginModal("New Target Wizard##Modal", "New Target", ICON_FA_CODE, Theme::Col::Accent, 480.0f, &wiz_close_x)) {
-            static int s_WizTemplate = 0; // 0=exe, 1=static, 2=shared, 3=interface, 4=from folder
+            static int s_WizTemplate = 0; // 0=exe, 1=static, 2=shared, 3=interface, 4=from folder, 5=kernel
+            static int s_WizKernelProto = 0; // 0=Multiboot2, 1=Limine, 2=Minimal
             static char s_WizName[128] = "my_target";
             static char s_WizFolder[256] = "";
             static std::string s_WizError = "";
             static std::unordered_set<std::string> s_WizDeps;
 
-            const char* templates[] = { "Executable", "Static library", "Shared library", "Header-only (interface)", "From folder..." };
+            const char* templates[] = {
+                "Executable",
+                "Static library",
+                "Shared library",
+                "Header-only (interface)",
+                "From folder...",
+                "Kernel (freestanding OS)"
+            };
             ImGui::TextColored(Theme::Col::Text, "Template:");
             ImGui::SameLine(140.0f * Theme::DpiScale);
             ImGui::SetNextItemWidth(240.0f * Theme::DpiScale);
-            if (ImGui::Combo("##WizTemplate", &s_WizTemplate, templates, 5)) {
+            if (ImGui::Combo("##WizTemplate", &s_WizTemplate, templates, 6)) {
                 if (s_WizTemplate == 4) {
                     nfdchar_t* out_dir = nullptr;
                     std::string root_s = project.GetRootPath().generic_u8string();
@@ -1240,6 +1481,8 @@ void RenderBuildListPanel(
                         if (!fname.empty()) std::strncpy(s_WizName, fname.c_str(), sizeof(s_WizName) - 1);
                         NFD_FreePath(out_dir);
                     }
+                } else if (s_WizTemplate == 5 && std::strcmp(s_WizName, "my_target") == 0) {
+                    std::strncpy(s_WizName, "kernel", sizeof(s_WizName) - 1);
                 }
             }
 
@@ -1253,6 +1496,13 @@ void RenderBuildListPanel(
                 ImGui::SameLine(140.0f * Theme::DpiScale);
                 ImGui::SetNextItemWidth(240.0f * Theme::DpiScale);
                 ImGui::InputText("##WizFolder", s_WizFolder, sizeof(s_WizFolder));
+            } else if (s_WizTemplate == 5) {
+                const char* protos[] = { "Multiboot2 (GRUB)", "Limine", "None (minimal freestanding)" };
+                ImGui::TextColored(Theme::Col::Text, "Boot Protocol:");
+                ImGui::SameLine(140.0f * Theme::DpiScale);
+                ImGui::SetNextItemWidth(240.0f * Theme::DpiScale);
+                ImGui::Combo("##WizKernelProto", &s_WizKernelProto, protos, 3);
+                ImGui::TextColored(Theme::Col::TextDim, "Creates starter kernel files if missing (never overwrites existing).");
             }
 
             if (!project.GetTargets().empty()) {
@@ -1282,16 +1532,23 @@ void RenderBuildListPanel(
             ImGui::SameLine();
             if (Theme::SuccessButton("Create Target", nullptr, ImVec2(120.0f * Theme::DpiScale, Theme::Btn::DefaultH))) {
                 core::Target nt;
-                nt.name = s_WizName;
-                if (s_WizTemplate == 1) nt.kind = core::TargetKind::Static;
-                else if (s_WizTemplate == 2) nt.kind = core::TargetKind::Shared;
-                else if (s_WizTemplate == 3) nt.kind = core::TargetKind::Interface;
-                else nt.kind = core::TargetKind::Executable;
+                if (s_WizTemplate == 5) {
+                    core::KernelBootProtocol kproto = core::KernelBootProtocol::Multiboot2;
+                    if (s_WizKernelProto == 1) kproto = core::KernelBootProtocol::Limine;
+                    else if (s_WizKernelProto == 2) kproto = core::KernelBootProtocol::Minimal;
+                    core::CreateKernelStarterTemplate(project.GetRootPath(), s_WizName, kproto, nt, nullptr);
+                } else {
+                    nt.name = s_WizName;
+                    if (s_WizTemplate == 1) nt.kind = core::TargetKind::Static;
+                    else if (s_WizTemplate == 2) nt.kind = core::TargetKind::Shared;
+                    else if (s_WizTemplate == 3) nt.kind = core::TargetKind::Interface;
+                    else nt.kind = core::TargetKind::Executable;
 
-                if (s_WizTemplate == 4 && s_WizFolder[0] != '\0') {
-                    core::SourceRule r;
-                    r.include = std::string(s_WizFolder) + "/**/*.{c,cc,cpp,cxx}";
-                    nt.sources.push_back(std::move(r));
+                    if (s_WizTemplate == 4 && s_WizFolder[0] != '\0') {
+                        core::SourceRule r;
+                        r.include = std::string(s_WizFolder) + "/**/*.{c,cc,cpp,cxx}";
+                        nt.sources.push_back(std::move(r));
+                    }
                 }
                 for (const auto& d : s_WizDeps) nt.deps.push_back(d);
 
@@ -1318,7 +1575,19 @@ void RenderBuildListPanel(
 
             ImGui::TextColored(Theme::Col::Text, "Condition (optional):");
             ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##RuleCond", "e.g. windows && !clang", s_RuleCondBuf, sizeof(s_RuleCondBuf));
+            ImGui::InputTextWithHint("##RuleCond", "e.g. windows && (msvc || clangcl) && !config:Shipping", s_RuleCondBuf, sizeof(s_RuleCondBuf));
+            std::string rule_cond_err;
+            bool rule_cond_valid = core::ValidateCondition(s_RuleCondBuf, rule_cond_err);
+            if (!rule_cond_valid) {
+                ImGui::TextColored(Theme::Col::Error, "%s %s", ICON_FA_CIRCLE_EXCLAMATION, rule_cond_err.c_str());
+            } else if (s_RuleCondBuf[0] != '\0') {
+                core::ConditionEvalResult ev = core::EvaluateCondition(s_RuleCondBuf, core::BuildConditionContext(project));
+                if (ev.active) {
+                    ImGui::TextColored(Theme::Col::Success, "Condition is currently active");
+                } else {
+                    ImGui::TextColored(Theme::Col::Warning, "%s", ev.reason.c_str());
+                }
+            }
 
             ImGui::TextColored(Theme::Col::TextDim, "Exclude Globs:");
             int del_ex = -1;
@@ -1379,6 +1648,7 @@ void RenderBuildListPanel(
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
+            if (!rule_cond_valid) ImGui::BeginDisabled(true);
             if (Theme::SuccessButton("Save Rule", nullptr, ImVec2(100.0f * Theme::DpiScale, Theme::Btn::DefaultH))) {
                 if (const core::Target* cur_t = project.FindTarget(s_RuleEditTarget)) {
                     core::Target updated = *cur_t;
@@ -1399,6 +1669,10 @@ void RenderBuildListPanel(
                 }
                 s_ShowRuleEditor = false;
                 ImGui::CloseCurrentPopup();
+            }
+            if (!rule_cond_valid) {
+                ImGui::EndDisabled();
+                Theme::Tooltip(rule_cond_err.c_str());
             }
             Theme::EndModal();
         }

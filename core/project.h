@@ -2,6 +2,8 @@
 
 #include "source_rules.h"
 #include "target.h"
+#include "tool_registry.h"
+#include "toolchain.h"
 
 #include <string>
 #include <vector>
@@ -25,6 +27,13 @@ struct ConfigOverrides {
     std::vector<std::string> defines;
     std::vector<std::string> compileFlags;
     std::vector<std::string> linkFlags;
+};
+
+// V2-19 compile_commands.json export configuration
+struct CompileCommandsConfig {
+    bool enabled = true;
+    std::string path = "compile_commands.json";
+    bool allConfigs = false;
 };
 
 // Manages persistent recent project paths in %APPDATA%/GenieBuild/recent.json (Spec §5)
@@ -75,6 +84,12 @@ public:
     const std::string& GetCCompiler() const { return m_c_compiler; }
     void SetCCompiler(const std::string& c_compiler);
 
+    // V2-14 Active toolchain profile & project-local custom profiles
+    const std::string& GetToolchain() const { return m_toolchain; }
+    void SetToolchain(const std::string& toolchain_name, const std::string& fallback_compiler = "", const std::string& fallback_c_compiler = "");
+    const std::vector<ToolchainProfile>& GetProjectToolchains() const { return m_project_toolchains; }
+    void SetProjectToolchains(const std::vector<ToolchainProfile>& toolchains);
+
     // Active configuration: "Debug" or "Release" (Spec §5.1.4)
     const std::string& GetConfiguration() const { return m_configuration; }
     void SetConfiguration(const std::string& config);
@@ -85,9 +100,43 @@ public:
     const std::string& GetCStd() const { return m_c_std; }
     void SetCStd(const std::string& std_name);
 
-    // Parallel compile jobs (0 = auto-detect all cores) (Spec §5.1.5)
+    // Parallel compile jobs (0 = auto-detect all cores / RAM-aware in V2-13)
     int GetJobs() const { return m_jobs; }
     void SetJobs(int jobs);
+
+    // V2-7 Tool overrides & custom tools
+    const std::map<std::string, std::string>& GetToolOverrides() const { return m_tool_overrides; }
+    void SetToolOverrides(const std::map<std::string, std::string>& overrides);
+    const std::vector<CustomToolSpec>& GetCustomTools() const { return m_custom_tools; }
+    void SetCustomTools(const std::vector<CustomToolSpec>& tools);
+    const std::string& GetAsmMode() const { return m_asm_mode; }
+    void SetAsmMode(const std::string& mode);
+
+    // V2-11 Dep log options
+    bool GetIgnoreSystemHeaders() const { return m_ignore_system_headers; }
+    void SetIgnoreSystemHeaders(bool ignore);
+    bool GetKeepDepFiles() const { return m_keep_dep_files; }
+    void SetKeepDepFiles(bool keep);
+
+    // V2-12 Linker options
+    const std::string& GetLinker() const { return m_linker; }
+    void SetLinker(const std::string& linker);
+    bool GetIncrementalLink() const { return m_incremental_link; }
+    void SetIncrementalLink(bool inc);
+    const std::string& GetDebugLink() const { return m_debug_link; }
+    void SetDebugLink(const std::string& mode);
+    bool GetSplitDwarf() const { return m_split_dwarf; }
+    void SetSplitDwarf(bool split);
+
+    // V2-13 Scheduler options
+    int GetMemPerJobMb() const { return m_mem_per_job_mb; }
+    void SetMemPerJobMb(int mb);
+    int GetLinkJobs() const { return m_link_jobs; }
+    void SetLinkJobs(int lj);
+    bool GetKeepGoing() const { return m_keep_going; }
+    void SetKeepGoing(bool kg);
+    bool GetLowPriority() const { return m_low_priority; }
+    void SetLowPriority(bool lp);
 
     // Warning level (e.g. "Off", "-Wall", "-Wall -Wextra")
     const std::string& GetWarnings() const { return m_warnings; }
@@ -102,6 +151,8 @@ public:
     void SetLibDirs(const std::vector<std::string>& dirs);
     const std::vector<std::string>& GetLibs() const { return m_libs; }
     void SetLibs(const std::vector<std::string>& libs);
+    const std::map<std::string, std::string>& GetLibConditions() const { return m_lib_conditions; }
+    void SetLibConditions(const std::map<std::string, std::string>& conds);
 
     // Preprocessor definitions (Spec §5.1.3)
     const std::vector<std::string>& GetDefines() const { return m_defines; }
@@ -239,6 +290,10 @@ public:
     bool GetConfirmLargeBuild() const { return m_confirm_large_build; }
     void SetConfirmLargeBuild(bool confirm) { m_confirm_large_build = confirm; MarkDirty(); }
 
+    // V2-19 compile_commands.json export configuration
+    const CompileCommandsConfig& GetCompileCommandsConfig() const { return m_compile_commands_cfg; }
+    void SetCompileCommandsConfig(const CompileCommandsConfig& cfg);
+
     // Background auto-fill scan state
     bool IsScanning() const { return m_is_scanning.load(); }
 
@@ -263,6 +318,8 @@ private:
 
     std::string m_compiler = "g++";
     std::string m_c_compiler = "gcc";
+    std::string m_toolchain;
+    std::vector<ToolchainProfile> m_project_toolchains;
     std::string m_configuration = "Debug";
     std::string m_cxx_std = "c++17";
     std::string m_c_std = "c11";
@@ -271,6 +328,7 @@ private:
     std::vector<std::string> m_include_dirs;
     std::vector<std::string> m_lib_dirs;
     std::vector<std::string> m_libs;
+    std::map<std::string, std::string> m_lib_conditions;
     std::vector<std::string> m_defines;
     std::vector<std::string> m_copy_dlls;
     std::vector<std::string> m_compile_flags;
@@ -278,11 +336,27 @@ private:
     std::map<std::string, ConfigOverrides> m_configs;
     std::vector<std::string> m_schema_warnings;
 
+    // V2-7 / V2-11 / V2-12 / V2-13 project fields
+    std::map<std::string, std::string> m_tool_overrides;
+    std::vector<CustomToolSpec> m_custom_tools;
+    std::string m_asm_mode = "auto";
+    bool m_ignore_system_headers = true;
+    bool m_keep_dep_files = false;
+    std::string m_linker = "default";
+    bool m_incremental_link = true;
+    std::string m_debug_link = "full";
+    bool m_split_dwarf = false;
+    int m_mem_per_job_mb = 2048;
+    int m_link_jobs = 1;
+    bool m_keep_going = false;
+    bool m_low_priority = true;
+
     std::string m_output_dir = ".geniebuild/out";
     std::vector<std::string> m_files;
     std::unordered_set<std::string> m_files_set; // O(1) set kept in sync with m_files
     std::vector<float> m_pane_widths; // Saved pane widths for draggable splitters
     bool m_confirm_large_build = true; // Huge-list warning confirmation flag (Spec §3.7)
+    CompileCommandsConfig m_compile_commands_cfg;
 
     // Cached missing files (checked once when list changes or on refresh)
     std::unordered_set<std::string> m_missing_files_set;

@@ -1,5 +1,6 @@
 #include "source_rules.h"
 #include "project.h"
+#include "fs_util.h"
 
 #include <algorithm>
 #include <cctype>
@@ -66,7 +67,9 @@ static std::vector<std::string> SplitSegments(const std::string& path) {
 }
 
 bool IsCompilableSourceExtension(const std::string& ext_lower) {
-    return (ext_lower == ".cpp" || ext_lower == ".c" || ext_lower == ".cc" || ext_lower == ".cxx");
+    return (ext_lower == ".cpp" || ext_lower == ".c" || ext_lower == ".cc" || ext_lower == ".cxx" ||
+            ext_lower == ".rc" || ext_lower == ".s" || ext_lower == ".asm" ||
+            ext_lower == ".cu" || ext_lower == ".ispc");
 }
 
 bool IsHeaderExtension(const std::string& ext_lower) {
@@ -348,7 +351,7 @@ static std::vector<CachedDirEntry> EnumerateDirectoryOS(
 ) {
     std::vector<CachedDirEntry> result;
 #if defined(_WIN32)
-    std::wstring search_w = dir_path.wstring();
+    std::wstring search_w = fs_util::ToWinLongPath(dir_path).wstring();
     if (!search_w.empty() && search_w.back() != L'\\' && search_w.back() != L'/') {
         search_w += L'\\';
     }
@@ -425,7 +428,7 @@ const std::vector<CachedDirEntry>& DirectoryCache::GetEntries(
     std::filesystem::path full_dir = norm.empty() ? root : (root / std::filesystem::u8path(norm));
 
     std::error_code ec;
-    auto disk_mtime = std::filesystem::last_write_time(full_dir, ec);
+    auto disk_mtime = std::filesystem::last_write_time(fs_util::ToWinLongPath(full_dir), ec);
     if (ec) {
         static const std::vector<CachedDirEntry> s_empty;
         return s_empty;
@@ -450,83 +453,23 @@ const std::vector<CachedDirEntry>& DirectoryCache::GetEntries(
 }
 
 // -----------------------------------------------------------------------------
-// Simple Condition Evaluator
+// Condition Evaluator (delegates to V2-5 core/condition.h)
 // -----------------------------------------------------------------------------
 
 bool EvaluateSimpleCondition(const std::string& expr, const std::string& os_name, const std::string& compiler_family) {
-    std::string s = ToLowerStr(expr);
-    // Trim
-    auto trim = [](std::string& str) {
-        while (!str.empty() && std::isspace(static_cast<unsigned char>(str.front()))) str.erase(str.begin());
-        while (!str.empty() && std::isspace(static_cast<unsigned char>(str.back()))) str.pop_back();
-    };
-    trim(s);
-    if (s.empty()) return true;
-
-    struct Parser {
-        const std::string& s;
-        size_t pos = 0;
-        std::string os;
-        std::string comp;
-
-        void skip_ws() {
-            while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
-        }
-        bool parse_or() {
-            bool lhs = parse_and();
-            while (true) {
-                skip_ws();
-                if (pos + 1 < s.size() && s[pos] == '|' && s[pos + 1] == '|') {
-                    pos += 2;
-                    bool rhs = parse_and();
-                    lhs = lhs || rhs;
-                } else break;
-            }
-            return lhs;
-        }
-        bool parse_and() {
-            bool lhs = parse_unary();
-            while (true) {
-                skip_ws();
-                if (pos + 1 < s.size() && s[pos] == '&' && s[pos + 1] == '&') {
-                    pos += 2;
-                    bool rhs = parse_unary();
-                    lhs = lhs && rhs;
-                } else break;
-            }
-            return lhs;
-        }
-        bool parse_unary() {
-            skip_ws();
-            if (pos < s.size() && s[pos] == '!') {
-                ++pos;
-                return !parse_unary();
-            }
-            return parse_primary();
-        }
-        bool parse_primary() {
-            skip_ws();
-            if (pos < s.size() && s[pos] == '(') {
-                ++pos;
-                bool v = parse_or();
-                skip_ws();
-                if (pos < s.size() && s[pos] == ')') ++pos;
-                return v;
-            }
-            size_t start = pos;
-            while (pos < s.size() && (std::isalnum(static_cast<unsigned char>(s[pos])) || s[pos] == '_' || s[pos] == ':' || s[pos] == '-')) {
-                ++pos;
-            }
-            std::string tok = s.substr(start, pos - start);
-            if (tok == "windows" || tok == "linux" || tok == "macos") return tok == os;
-            if (tok == "msvc" || tok == "gcc" || tok == "clang" || tok == "clangcl") return tok == comp;
-            if (tok == "x64") return true;
-            return true;
-        }
-    };
-
-    Parser p{ s, 0, ToLowerStr(os_name), ToLowerStr(compiler_family) };
-    return p.parse_or();
+    ConditionContext ctx;
+    ctx.os = os_name;
+    ctx.compilerFamily = compiler_family;
+#if defined(_M_ARM64) || defined(__aarch64__)
+    ctx.arch = "arm64";
+#elif defined(_M_IX86) || defined(__i386__)
+    ctx.arch = "x86";
+#elif defined(__arm__)
+    ctx.arch = "arm";
+#else
+    ctx.arch = "x64";
+#endif
+    return EvaluateCondition(expr, ctx).active;
 }
 
 // -----------------------------------------------------------------------------
@@ -590,9 +533,11 @@ RuleExpansionResult ExpandRules(
 
     struct CompiledTargetInfo {
         std::string name;
+        bool active = true;
         std::vector<CompiledRuleInfo> rules;
         std::vector<CompiledGlob> target_excludes;
         std::vector<std::string> explicit_files;
+        std::unordered_set<std::string> extra_exts;
     };
 
     std::vector<CompiledTargetInfo> compiled_targets;
@@ -605,6 +550,9 @@ RuleExpansionResult ExpandRules(
         CompiledTargetInfo ct;
         ct.name = t.name;
         ct.explicit_files = t.explicit_files;
+        for (const auto& ee : t.extra_extensions) {
+            ct.extra_exts.insert(ToLowerStr(ee));
+        }
 
         for (const auto& ex : t.target_excludes) {
             CompiledGlob cg = CompiledGlob::Compile(ex);
@@ -614,12 +562,18 @@ RuleExpansionResult ExpandRules(
         TargetRuleOutput& out = result.per_target[t.name];
         out.rule_match_counts.assign(t.rules.size(), 0);
 
+        ConditionContext ctx = t.condition_ctx;
+        if (ctx.os.empty()) ctx.os = t.condition_os;
+        if (ctx.compilerFamily.empty()) ctx.compilerFamily = t.condition_compiler;
+        bool target_active = t.target_condition.empty() || EvaluateCondition(t.target_condition, ctx).active;
+        ct.active = target_active;
+
         for (size_t ri = 0; ri < t.rules.size(); ++ri) {
             const auto& r = t.rules[ri];
             CompiledRuleInfo cr;
             cr.rule_idx = ri;
             cr.follow_links = r.follow_links;
-            cr.active = r.condition.empty() ? true : EvaluateSimpleCondition(r.condition, t.condition_os, t.condition_compiler);
+            cr.active = target_active && (r.condition.empty() || EvaluateCondition(r.condition, ctx).active);
             cr.include = CompiledGlob::Compile(r.include);
             for (const auto& ex : r.exclude) {
                 CompiledGlob cg = CompiledGlob::Compile(ex);
@@ -680,11 +634,12 @@ RuleExpansionResult ExpandRules(
                     if (dot != std::string::npos) {
                         ext = ToLowerStr(entry.name.substr(dot));
                     }
-                    bool is_src = IsCompilableSourceExtension(ext);
-                    bool is_hdr = !is_src && IsHeaderExtension(ext);
-                    if (!is_src && !is_hdr) continue;
+                    bool is_std_src = IsCompilableSourceExtension(ext);
+                    bool is_hdr = !is_std_src && IsHeaderExtension(ext);
 
                     for (const auto& ct : compiled_targets) {
+                        bool is_src = is_std_src || (ct.extra_exts.find(ext) != ct.extra_exts.end());
+                        if (!is_src && !is_hdr) continue;
                         bool target_excluded = false;
                         for (const auto& tex : ct.target_excludes) {
                             if (tex.Matches(rel_entry)) {
@@ -727,7 +682,8 @@ RuleExpansionResult ExpandRules(
         for (const auto& wr : walk_roots) {
             std::error_code ec;
             std::filesystem::path check_p = wr.empty() ? root : (root / std::filesystem::u8path(wr));
-            if (std::filesystem::exists(check_p, ec) && std::filesystem::is_directory(check_p, ec)) {
+            std::filesystem::path check_lp = fs_util::ToWinLongPath(check_p);
+            if (std::filesystem::exists(check_lp, ec) && std::filesystem::is_directory(check_lp, ec)) {
                 walk_dir(walk_dir, wr);
             }
         }
@@ -752,8 +708,10 @@ RuleExpansionResult ExpandRules(
         out.header_files.assign(hdr_set.begin(), hdr_set.end());
         std::sort(out.header_files.begin(), out.header_files.end());
 
-        for (const auto& f : out.source_files) {
-            file_to_targets[f].push_back(ct.name);
+        if (ct.active) {
+            for (const auto& f : out.source_files) {
+                file_to_targets[f].push_back(ct.name);
+            }
         }
     }
 
@@ -764,6 +722,49 @@ RuleExpansionResult ExpandRules(
     }
 
     return result;
+}
+
+std::vector<std::string> ExpandGlobFiles(
+    const std::filesystem::path& root,
+    const std::string& pattern,
+    DirectoryCache& cache
+) {
+    std::vector<std::string> matches;
+    if (root.empty() || pattern.empty()) return matches;
+
+    CompiledGlob cg = CompiledGlob::Compile(pattern);
+    if (!cg.IsValid()) return matches;
+
+    std::string walk_root = NormalizeRelPath(cg.LongestLiteralPrefix());
+    std::unordered_set<std::string> visited_dirs;
+    std::unordered_set<std::string> seen_files;
+
+    auto walk_dir = [&](auto& self, const std::string& rel_dir) -> void {
+        std::string norm_dir = NormalizeRelPath(rel_dir);
+        if (!visited_dirs.insert(ToLowerStr(norm_dir)).second) return;
+
+        const auto& entries = cache.GetEntries(root, norm_dir, false);
+        for (const auto& entry : entries) {
+            std::string child_rel = norm_dir.empty() ? entry.name : (norm_dir + "/" + entry.name);
+            if (entry.is_directory) {
+                if (entry.is_symlink) continue;
+                bool descend = IsPrefixOrEqualDir(child_rel, walk_root) ||
+                               cg.ExplicitlyNamesDir(entry.name) ||
+                               !Project::ShouldSkipDirectory(entry.name);
+                if (descend) {
+                    self(self, child_rel);
+                }
+            } else {
+                if (cg.Matches(child_rel) && seen_files.insert(child_rel).second) {
+                    matches.push_back(child_rel);
+                }
+            }
+        }
+    };
+
+    walk_dir(walk_dir, walk_root);
+    std::sort(matches.begin(), matches.end());
+    return matches;
 }
 
 RulePreviewResult PreviewRule(
@@ -844,7 +845,8 @@ void FileWatcher::Start(const std::filesystem::path& root, DirectoryCache* cache
     Stop();
     if (root.empty() || !cache) return;
     std::error_code ec;
-    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
+    const std::filesystem::path root_lp = fs_util::ToWinLongPath(root);
+    if (!std::filesystem::exists(root_lp, ec) || !std::filesystem::is_directory(root_lp, ec)) {
         return;
     }
 

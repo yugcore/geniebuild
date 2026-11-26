@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include <memory>
 
 namespace core {
 
@@ -10,6 +11,9 @@ class Project; // Forward declaration
 struct Target;
 struct EffectiveTargetSettings;
 struct EffectiveFileSettings;
+struct ToolchainProfile;
+struct ToolchainResolution;
+struct MsvcEnvCacheState;
 
 // Identifies which language(s) a compiler toolchain handles
 enum class CompilerLanguage {
@@ -30,7 +34,8 @@ enum class SourceLanguageType {
 struct CompilerInfo {
     std::string name;                     // e.g. "g++", "clang++", "cl", "gcc", "clang"
     std::filesystem::path executable_path; // Full resolved path from PATH
-    CompilerLanguage language;
+    CompilerLanguage language = CompilerLanguage::Cxx;
+    std::shared_ptr<const ToolchainProfile> profile; // V2-14 optional backing profile
 
     bool IsCxxCompatible() const {
         return language == CompilerLanguage::Cxx || language == CompilerLanguage::Both;
@@ -46,6 +51,7 @@ struct BuildCommand {
     std::string program;                // Path or executable name to launch
     std::vector<std::string> arguments; // Arguments vector (for reproc process launch)
     std::string display_command;        // Formatted command line string for display in Output pane
+    std::string hash_salt;              // Extra version/sysroot/triple salt hashed in ComputeCommandHash
 };
 
 // Manages compiler detection from PATH and command-line formulation.
@@ -53,12 +59,21 @@ struct BuildCommand {
 class CompilerManager {
 public:
     CompilerManager();
+    ~CompilerManager();
 
-    // Searches system PATH for standard C/C++ compilers (g++, clang++, cl, gcc, clang)
-    void DetectCompilers();
+    // Searches system PATH + VS/cross installs for compilers and toolchain profiles
+    void DetectCompilers(bool force_vs_refresh = false);
 
     // Returns all detected compilers
     const std::vector<CompilerInfo>& GetDetectedCompilers() const { return m_detected_compilers; }
+
+    // V2-14 / V2-17 Toolchain profile queries & resolution
+    std::vector<ToolchainProfile> GetDetectedToolchains() const;
+    std::vector<ToolchainProfile> GetMergedToolchains(const Project& project) const;
+    ToolchainResolution ResolveProjectToolchain(const Project& project) const;
+    CompilerInfo MakeCompilerInfoFromProfile(const ToolchainProfile& profile, bool for_c = false) const;
+    MsvcEnvCacheState GetMsvcEnvState() const;
+    void DismissMsvcBanner();
 
     // Returns true if at least one compiler is available
     bool HasCompilers() const { return !m_detected_compilers.empty(); }
@@ -74,6 +89,17 @@ public:
 
     // Checks MSVC Developer Command Prompt environment (Spec §5.1 guards)
     static bool CheckMsvcEnvironment(std::string& out_error_message);
+
+    // Validates V2-12 linker options and tool availability (lld, mold, gold, fastLink, splitDwarf)
+    static bool ValidateLinkerOptions(
+        const Project& project,
+        bool is_msvc,
+        bool is_clang,
+        std::string& out_error_message
+    );
+
+    // Checks if a specific linker executable (lld / lld-link / mold / ld.gold) is available on PATH
+    static bool IsLinkerAvailable(const std::string& linker_mode, bool is_msvc);
 
     // Splits raw flag strings shell-style keeping quotes intact (Spec §5.1.3)
     static std::vector<std::string> SplitFlags(const std::string& raw_flags);
@@ -142,7 +168,9 @@ public:
     );
 
 private:
+    struct ToolchainCacheState;
     std::vector<CompilerInfo> m_detected_compilers;
+    std::shared_ptr<ToolchainCacheState> m_tc_state;
 };
 
 } // namespace core

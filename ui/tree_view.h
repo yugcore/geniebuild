@@ -2,6 +2,7 @@
 
 #include "theme.h"
 #include "icons.h"
+#include "tool_registry.h"
 #include <imgui.h>
 #include <string>
 #include <vector>
@@ -20,6 +21,8 @@ struct TreeRow {
     std::string name;               // Display filename or directory segment name
     std::string rel_path;           // Normalized path relative to project root
     std::string extra_label;        // Optional count or metadata, e.g. " (24)"
+    std::string type_badge;         // V2-7 badge: RC, ASM, CUDA, ISPC, or custom tool
+    ImU32 type_badge_color = 0;     // Non-zero badge text color
     TreeRowType type = TreeRowType::Folder;
     int depth = 0;                  // Indentation depth level (0 = top-level)
     uint64_t ancestor_has_next = 0; // Bitmask for tree guide lines
@@ -38,6 +41,42 @@ struct TreeRow {
     std::vector<ImVec4> target_dots; // Colored dots for owning targets in multi-target mode
     void* user_data = nullptr;      // Arbitrary user pointer
 };
+
+inline void PopulateTreeRowTypeBadge(TreeRow& row, const std::vector<core::CustomToolSpec>& custom_tools) {
+    if (row.type != TreeRowType::SourceFile || row.rel_path.empty()) return;
+    core::SourceFileKind kind = core::ToolRegistry::ClassifySourceFile(row.rel_path, custom_tools);
+    switch (kind) {
+        case core::SourceFileKind::Rc:
+            row.type_badge = "RC";
+            row.type_badge_color = IM_COL32(230, 175, 75, 235);
+            break;
+        case core::SourceFileKind::AsmPre:
+        case core::SourceFileKind::AsmRaw:
+        case core::SourceFileKind::AsmNasm:
+            row.type_badge = "ASM";
+            row.type_badge_color = IM_COL32(180, 140, 235, 235);
+            break;
+        case core::SourceFileKind::Cuda:
+            row.type_badge = "CUDA";
+            row.type_badge_color = IM_COL32(118, 210, 80, 235);
+            break;
+        case core::SourceFileKind::Ispc:
+            row.type_badge = "ISPC";
+            row.type_badge_color = IM_COL32(90, 200, 235, 235);
+            break;
+        case core::SourceFileKind::Custom: {
+            std::string ext = row.rel_path;
+            size_t dot = ext.find_last_of('.');
+            ext = (dot != std::string::npos) ? ext.substr(dot + 1) : "TOOL";
+            for (char& ch : ext) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            row.type_badge = ext.empty() ? "TOOL" : ext;
+            row.type_badge_color = IM_COL32(235, 130, 170, 235);
+            break;
+        }
+        default:
+            break;
+    }
+}
 
 struct TreeRowResult {
     bool selected_changed = false;  // User single-clicked to select
@@ -314,6 +353,19 @@ inline TreeRowResult RenderTreeRow(
             );
             ImGui::PopFont();
             name_w += ImGui::CalcTextSize(" [excluded]").x;
+        }
+
+        if (!row.type_badge.empty()) {
+            ImGui::PushFont(g_Fonts.secondary);
+            ImU32 badge_col = row.type_badge_color != 0 ? row.type_badge_color : ImGui::ColorConvertFloat4ToU32(Theme::Col::Accent);
+            std::string btxt = "[" + row.type_badge + "]";
+            dl->AddText(
+                ImVec2(cursor_x + name_w + 6.0f * dpi, mid_text_y),
+                badge_col,
+                btxt.c_str()
+            );
+            name_w += ImGui::CalcTextSize(btxt.c_str()).x + 6.0f * dpi;
+            ImGui::PopFont();
         }
 
         if (row.has_override) {

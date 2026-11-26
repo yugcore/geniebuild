@@ -3,12 +3,21 @@
 #include "icons.h"
 #include "file_tree_panel.h"
 #include "build_runner.h"
+#include "build_steps.h"
 #include "build_settings_modal.h"
+#include "output_panel.h"
+#include "toolchain.h"
+#include "msvc_env.h"
+#include "compdb.h"
+#include "fs_util.h"
+#include "hints.h"
 #include <imgui.h>
 #include <nfd.h>
 #include <cstring>
 #include <string>
+#include <filesystem>
 #include <algorithm>
+#include <cctype>
 
 #if defined(_WIN32)
 #define GLFW_EXPOSE_NATIVE_WIN32
@@ -21,11 +30,146 @@ namespace ui {
 
 static bool s_ShowLargeBuildModal = false;
 static bool s_ShowExitWhileBuildingModal = false;
+static bool s_ShowTrustModal = false;
+static bool s_TrustPendingBuild = false;
+static bool s_TrustPendingRebuild = false;
+static std::string s_TrustPendingTarget = "";
+static std::string s_PromptedTrustRoot = "";
 static std::string s_PendingBuildTarget = "";
 static bool s_PendingRebuild = false;
 
+static core::RunRunner* s_ActiveRunRunner = nullptr;
+static bool s_PendingRunAfterBuild = false;
+static bool s_PendingRunIsDebug = false;
+static bool s_ShowRunningExeConflictModal = false;
+static std::string s_ConflictExePath = "";
+static bool s_ConflictIsRebuild = false;
+static std::string s_ConflictTarget = "";
+static std::string s_DismissedFallbackKey = "";
+static std::string s_DismissedPeWarnKey = "";
+
+// V2-22 / V2-23 / V2-24 Modals & Banners
+static bool s_ShowLongPathHelpModal = false;
+static bool s_ShowDefenderHelpModal = false;
+static bool s_DismissedDefenderSession = false;
+static bool s_ShowImportModal = false;
+static bool s_ShowImportChecklistBanner = false;
+static core::ImportPlan s_ImportPlan;
+static std::string s_ImportRootBuf;
+static int s_ImportSelectedTarget = 0;
+static std::string s_ImportWriteError;
+static bool s_LongPathsEnabledCached = true;
+static bool s_LongPathsChecked = false;
+
+void SetActiveRunRunner(core::RunRunner* run_runner) {
+    s_ActiveRunRunner = run_runner;
+}
+
+static std::string ToLowerGenericPath(const std::filesystem::path& p) {
+    std::error_code ec;
+    std::filesystem::path norm = std::filesystem::weakly_canonical(p, ec);
+    std::string s = ec ? p.lexically_normal().generic_u8string() : norm.generic_u8string();
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+static bool CheckRunningExeConflict(
+    const core::Project& project,
+    const std::string& target_name,
+    std::string& out_conflict_path
+) {
+#if defined(_WIN32)
+    if (!s_ActiveRunRunner || !s_ActiveRunRunner->IsRunning()) return false;
+    std::string running = s_ActiveRunRunner->GetRunningProgram();
+    if (running.empty()) return false;
+    std::string run_low = ToLowerGenericPath(std::filesystem::u8path(running));
+    for (const auto& t : project.GetTargets()) {
+        if (!target_name.empty() && t.name != target_name) continue;
+        if (t.kind != core::TargetKind::Executable) continue;
+        std::filesystem::path bin_p = t.GetBinaryPath(project.GetAbsoluteOutputDir(), project.GetConfiguration(), false);
+        std::string bin_low = ToLowerGenericPath(bin_p);
+        if (!bin_low.empty() && bin_low == run_low) {
+            out_conflict_path = bin_p.generic_u8string();
+            return true;
+        }
+    }
+#else
+    (void)project;
+    (void)target_name;
+    (void)out_conflict_path;
+#endif
+    return false;
+}
+
+static const core::Target* FindStartupTarget(const core::Project& project) {
+    if (!project.GetStartupTarget().empty()) {
+        if (const core::Target* t = project.FindTarget(project.GetStartupTarget())) {
+            return t;
+        }
+    }
+    return project.GetPrimaryTarget();
+}
+
+static bool LaunchRunConfig(
+    const core::Project& project,
+    const core::CompilerManager& compiler_manager,
+    core::RunRunner& run_runner,
+    std::vector<core::OutLine>& run_lines,
+    std::string& run_start_error,
+    bool is_debug
+) {
+    const core::Target* startup = FindStartupTarget(project);
+    if (!startup) {
+        const auto& ts = project.GetTargets();
+        if (!ts.empty()) startup = &ts[0];
+    }
+    if (!startup) {
+        run_start_error = "No target configured.";
+        RequestOutputTab(true);
+        return false;
+    }
+    const core::RunConfig& rc = is_debug ? startup->debug : startup->run;
+    if (rc.command.empty()) {
+        run_start_error = is_debug ? "No Debug command configured for startup target."
+                                   : "No Run command configured. Configure Run in Build Settings -> Run / Debug.";
+        RequestOutputTab(true);
+        return false;
+    }
+
+    auto tc_res = compiler_manager.ResolveProjectToolchain(project);
+    std::filesystem::path cwd;
+    std::unordered_map<std::string, std::string> env;
+    core::BuildCommand cmd = core::FormulateRunCommand(project, *startup, rc, &tc_res.profile, cwd, env);
+    if (cmd.program.empty()) {
+        run_start_error = "Failed to formulate run command.";
+        RequestOutputTab(true);
+        return false;
+    }
+
+    run_lines.clear();
+    run_start_error.clear();
+    core::OutLine header;
+    header.kind = core::OutLineKind::Status;
+    header.text = "> " + cmd.display_command;
+    run_lines.push_back(std::move(header));
+
+    RequestOutputTab(true);
+    return run_runner.Start(cmd, cwd, &env, &run_start_error);
+}
+
 void RequestExitConfirmation() {
     s_ShowExitWhileBuildingModal = true;
+}
+
+static bool EnsureProjectTrustedForBuild(core::Project& project, bool is_rebuild, const std::string& target_name) {
+    if (core::TrustStore::CountCustomCommands(project) > 0 && !core::TrustStore::IsTrusted(project.GetRootPath())) {
+        s_TrustPendingBuild = !is_rebuild;
+        s_TrustPendingRebuild = is_rebuild;
+        s_TrustPendingTarget = target_name;
+        s_ShowTrustModal = true;
+        return false;
+    }
+    return true;
 }
 
 void TriggerBuildWithGuard(
@@ -36,6 +180,18 @@ void TriggerBuildWithGuard(
     std::vector<core::OutLine>& output_lines,
     const std::string& target_name
 ) {
+    if (!EnsureProjectTrustedForBuild(project, false, target_name)) {
+        build_start_error = "Project is not trusted yet. Trust this folder to run custom build steps.";
+        return;
+    }
+    std::string conflict_path;
+    if (CheckRunningExeConflict(project, target_name, conflict_path)) {
+        s_ConflictExePath = conflict_path;
+        s_ConflictIsRebuild = false;
+        s_ConflictTarget = target_name;
+        s_ShowRunningExeConflictModal = true;
+        return;
+    }
     if (project.GetFiles().size() > 500 && project.GetConfirmLargeBuild()) {
         s_PendingBuildTarget = target_name;
         s_PendingRebuild = false;
@@ -55,6 +211,18 @@ void TriggerRebuildWithGuard(
     std::vector<core::OutLine>& output_lines,
     const std::string& target_name
 ) {
+    if (!EnsureProjectTrustedForBuild(project, true, target_name)) {
+        build_start_error = "Project is not trusted yet. Trust this folder to run custom build steps.";
+        return;
+    }
+    std::string conflict_path;
+    if (CheckRunningExeConflict(project, target_name, conflict_path)) {
+        s_ConflictExePath = conflict_path;
+        s_ConflictIsRebuild = true;
+        s_ConflictTarget = target_name;
+        s_ShowRunningExeConflictModal = true;
+        return;
+    }
     if (project.GetFiles().size() > 500 && project.GetConfirmLargeBuild()) {
         s_PendingBuildTarget = target_name;
         s_PendingRebuild = true;
@@ -64,6 +232,60 @@ void TriggerRebuildWithGuard(
         build_start_error.clear();
         build_runner.StartRebuild(project, compiler_manager, build_start_error, target_name);
     }
+}
+
+void TriggerRunWithGuard(
+    core::Project& project,
+    core::CompilerManager& compiler_manager,
+    core::BuildRunner& build_runner,
+    std::string& build_start_error,
+    std::vector<core::OutLine>& output_lines,
+    core::RunRunner& run_runner,
+    std::vector<core::OutLine>& run_lines,
+    std::string& run_start_error,
+    bool is_debug
+) {
+    s_ActiveRunRunner = &run_runner;
+    const core::Target* startup = FindStartupTarget(project);
+    if (!startup) {
+        run_start_error = "No active target found.";
+        RequestOutputTab(true);
+        return;
+    }
+    const core::RunConfig& rc = is_debug ? startup->debug : startup->run;
+    if (rc.command.empty()) {
+        run_start_error = is_debug ? "No Debug command configured for target."
+                                   : "No Run command configured. Set one in Build Settings -> Run / Debug.";
+        RequestOutputTab(true);
+        return;
+    }
+
+    if (core::TrustStore::CountCustomCommands(project) > 0 && !core::TrustStore::IsTrusted(project.GetRootPath())) {
+        s_TrustPendingBuild = false;
+        s_TrustPendingRebuild = false;
+        s_TrustPendingTarget = startup->name;
+        s_ShowTrustModal = true;
+        run_start_error = "Project folder is not trusted yet. Trust this folder to run custom commands.";
+        RequestOutputTab(true);
+        return;
+    }
+
+    if (!is_debug && rc.buildBeforeRun) {
+        if (run_runner.IsRunning()) {
+            run_runner.Stop();
+        }
+        s_PendingRunAfterBuild = true;
+        s_PendingRunIsDebug = false;
+        output_lines.clear();
+        build_start_error.clear();
+        if (!build_runner.StartBuild(project, compiler_manager, build_start_error, startup->name)) {
+            s_PendingRunAfterBuild = false;
+            RequestOutputTab(false);
+        }
+        return;
+    }
+
+    LaunchRunConfig(project, compiler_manager, run_runner, run_lines, run_start_error, is_debug);
 }
 
 #if defined(_WIN32)
@@ -315,12 +537,27 @@ void RenderTitleBar(
 void RenderToolBar(
     GLFWwindow* window,
     core::Project& project,
-    const core::CompilerManager& compiler_manager,
+    core::CompilerManager& compiler_manager,
     core::BuildRunner& build_runner,
     std::string& build_start_error,
-    std::vector<core::OutLine>& output_lines
+    std::vector<core::OutLine>& output_lines,
+    core::RunRunner* run_runner,
+    std::vector<core::OutLine>* run_lines,
+    std::string* run_start_error
 ) {
     (void)window;
+    if (run_runner) {
+        s_ActiveRunRunner = run_runner;
+    }
+    if (s_PendingRunAfterBuild && !build_runner.IsRunning()) {
+        s_PendingRunAfterBuild = false;
+        if (build_runner.GetLastResult().success && run_runner && run_lines && run_start_error) {
+            LaunchRunConfig(project, compiler_manager, *run_runner, *run_lines, *run_start_error, s_PendingRunIsDebug);
+        } else {
+            RequestOutputTab(false);
+        }
+    }
+
     const float open_btn_h = Theme::Btn::DefaultH;
     const float recent_arrow_w = Theme::Btn::SplitArrowW;
     const std::filesystem::path& root_path = project.GetRootPath();
@@ -332,6 +569,13 @@ void RenderToolBar(
     const float startup_combo_w = multi_target ? (126.0f * Theme::DpiScale) : 0.0f;
     const float startup_group_w = multi_target ? (startup_combo_w + Theme::Sp::S2) : 0.0f;
 
+    const core::Target* startup_tgt = FindStartupTarget(project);
+    const bool has_debug_btn = (run_runner != nullptr && startup_tgt != nullptr && !startup_tgt->debug.command.empty());
+    const float run_btn_w = (run_runner != nullptr) ? (76.0f * Theme::DpiScale) : 0.0f;
+    const float debug_btn_w = has_debug_btn ? (66.0f * Theme::DpiScale) : 0.0f;
+    const float run_group_w = (run_runner != nullptr ? (Theme::Sp::S2 + run_btn_w) : 0.0f)
+                            + (has_debug_btn ? (Theme::Sp::S1 + debug_btn_w) : 0.0f);
+
     const float cfg_combo_w   = 132.0f * Theme::DpiScale;
     const float cfg_group_w   = cfg_combo_w;
     const float build_btn_w   = Theme::Btn::BuildW;
@@ -340,12 +584,12 @@ void RenderToolBar(
     const float build_btn_h   = Theme::Btn::DefaultH;
     const float combo_width   = Theme::Dim::ComboW;
 
-    const char* label_text = "Compiler:";
+    const char* label_text = "Toolchain:";
     const float comp_label_w = ImGui::CalcTextSize(label_text).x;
 
-    // Compute responsive breakpoints (FPS overlay removed for clean toolbar alignment)
-    const float right_with_label = startup_group_w + cfg_group_w + Theme::Sp::S2 + comp_label_w + Theme::Sp::S1 + combo_width + Theme::Sp::S2 + build_group_w;
-    const float right_no_label   = startup_group_w + cfg_group_w + Theme::Sp::S2 + combo_width + Theme::Sp::S2 + build_group_w;
+    // Compute responsive breakpoints
+    const float right_with_label = startup_group_w + cfg_group_w + Theme::Sp::S2 + comp_label_w + Theme::Sp::S1 + combo_width + Theme::Sp::S2 + build_group_w + run_group_w;
+    const float right_no_label   = startup_group_w + cfg_group_w + Theme::Sp::S2 + combo_width + Theme::Sp::S2 + build_group_w + run_group_w;
 
     // -------------------------------------------------------------------------
     // Left group: Open Folder split button, Settings, Output Path
@@ -387,12 +631,14 @@ void RenderToolBar(
         if (recent_list.empty()) {
             ImGui::MenuItem("No recent projects", nullptr, false, false);
         } else {
-            for (const auto& rpath : recent_list) {
+            for (size_t ri = 0; ri < recent_list.size(); ++ri) {
+                const auto& rpath = recent_list[ri];
                 std::filesystem::path rp = std::filesystem::u8path(rpath);
                 std::string fname = rp.filename().generic_u8string();
                 if (fname.empty()) fname = rpath;
                 std::string label = std::string(ICON_FA_FOLDER) + "  " + fname;
 
+                ImGui::PushID(static_cast<int>(ri));
                 if (ImGui::MenuItem(label.c_str())) {
                     project.Load(rp);
                     RefreshFileTree();
@@ -400,8 +646,31 @@ void RenderToolBar(
                     build_start_error.clear();
                 }
                 Theme::Tooltip(rpath.c_str());
+                ImGui::PopID();
             }
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_CODE "  Import from compile_commands.json...")) {
+            nfdchar_t* out_cc = nullptr;
+            nfdu8filteritem_t cc_filter[1] = { { "Compilation Database", "json" } };
+            std::string start_d = root_path.generic_u8string();
+            if (NFD_OpenDialog(&out_cc, cc_filter, 1, start_d.empty() ? nullptr : start_d.c_str()) == NFD_OKAY && out_cc != nullptr) {
+                std::filesystem::path cc_path = std::filesystem::u8path(out_cc);
+                NFD_FreePath(out_cc);
+                std::filesystem::path guess_root = cc_path.parent_path();
+                std::string par_low = guess_root.filename().generic_u8string();
+                std::transform(par_low.begin(), par_low.end(), par_low.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (par_low == "build" || par_low == "out" || par_low.rfind("cmake-build", 0) == 0) {
+                    if (guess_root.has_parent_path()) guess_root = guess_root.parent_path();
+                }
+                s_ImportRootBuf = guess_root.generic_u8string();
+                s_ImportPlan = core::CompDbManager::AnalyzeCompileCommands(cc_path, guess_root);
+                s_ImportSelectedTarget = 0;
+                s_ImportWriteError.clear();
+                s_ShowImportModal = true;
+            }
+        }
+        Theme::Tooltip("One-time import from CMake/Meson/Bazel compile_commands.json into v2 project.json");
         ImGui::EndPopup();
     }
     ImGui::PopStyleVar(2);
@@ -534,12 +803,15 @@ void RenderToolBar(
         ImGui::TextColored(Theme::Col::TextDim, "  Configuration");
         ImGui::Separator();
         std::vector<std::string> cfg_names = project.GetConfigNames();
-        for (const auto& cname : cfg_names) {
+        for (size_t ci = 0; ci < cfg_names.size(); ++ci) {
+            const auto& cname = cfg_names[ci];
             bool sel = (cname == cur_cfg);
             std::string lbl = std::string(sel ? ICON_FA_CHECK "  " : "     ") + cname;
+            ImGui::PushID(static_cast<int>(ci));
             if (ImGui::MenuItem(lbl.c_str())) {
                 project.SetConfiguration(cname);
             }
+            ImGui::PopID();
         }
         ImGui::Separator();
         if (ImGui::MenuItem(ICON_FA_GEAR "  Manage configurations...")) {
@@ -551,77 +823,80 @@ void RenderToolBar(
 
     ImGui::SameLine(0.0f, Theme::Sp::S2);
 
-    // 2. Compiler Label & Selector
+    // 2. Toolchain Label & Selector (V2-14)
     if (show_comp_label) {
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(Theme::Col::TextDim, "%s", label_text);
         ImGui::SameLine(0.0f, Theme::Sp::S1);
     }
 
-    const auto& detected_compilers = compiler_manager.GetDetectedCompilers();
-    const bool has_compilers = !detected_compilers.empty();
+    auto merged_toolchains = compiler_manager.GetMergedToolchains(project);
+    auto tc_res = compiler_manager.ResolveProjectToolchain(project);
+    const bool has_compilers = !merged_toolchains.empty() || compiler_manager.HasCompilers();
 
-    std::string current_compiler = project.GetCompiler();
-    bool saved_compiler_found = false;
-
-    if (current_compiler.empty()) {
-        if (has_compilers) {
-            current_compiler = detected_compilers[0].name;
-            project.SetCompiler(current_compiler);
-            saved_compiler_found = true;
-        }
-    } else {
-        for (const auto& comp : detected_compilers) {
-            if (comp.name == current_compiler) {
-                saved_compiler_found = true;
-                break;
-            }
-        }
+    if (project.GetToolchain().empty() && project.GetCompiler().empty() && tc_res.found && !tc_res.profile.name.empty()) {
+        project.SetCompiler(tc_res.profile.name);
     }
 
     std::string preview_text;
-    if (!current_compiler.empty()) {
-        if (saved_compiler_found) {
-            preview_text = current_compiler;
-        } else {
-            preview_text = current_compiler + " (not found)";
+    if (!tc_res.profile.name.empty()) {
+        preview_text = tc_res.profile.name;
+        if (tc_res.isFallback) {
+            preview_text += " (fallback)";
         }
-    } else if (has_compilers) {
-        preview_text = detected_compilers[0].name;
+    } else if (!project.GetToolchain().empty()) {
+        preview_text = project.GetToolchain() + " (missing)";
     } else {
-        preview_text = "No compiler";
+        preview_text = "No toolchain";
     }
 
     static ImVec2 s_CompAnchorMin(0, 0);
     static ImVec2 s_CompAnchorMax(0, 0);
     bool compiler_popup_open = ImGui::IsPopupOpen("CompilerSelectPopup");
-    if (Theme::ComboButton("##CompilerSelector", preview_text.c_str(), "Select compiler toolchain", ImVec2(combo_width, build_btn_h), compiler_popup_open)) {
+    std::string tc_tip = tc_res.isFallback ? tc_res.bannerMessage : "Select compiler / cross toolchain (or open Toolchain Manager)";
+    if (Theme::ComboButton("##CompilerSelector", preview_text.c_str(), tc_tip.c_str(), ImVec2(combo_width, build_btn_h), compiler_popup_open)) {
         s_CompAnchorMin = ImGui::GetItemRectMin();
         s_CompAnchorMax = ImGui::GetItemRectMax();
         ImGui::OpenPopup("CompilerSelectPopup");
     }
 
     ImGui::SetNextWindowPos(ImVec2(s_CompAnchorMin.x, s_CompAnchorMax.y + 4.0f * Theme::DpiScale), ImGuiCond_Appearing);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(combo_width, 0.0f), ImVec2(480.0f * Theme::DpiScale, 280.0f * Theme::DpiScale));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(combo_width, 0.0f), ImVec2(520.0f * Theme::DpiScale, 320.0f * Theme::DpiScale));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * Theme::DpiScale, 6.0f * Theme::DpiScale));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * Theme::DpiScale, 4.0f * Theme::DpiScale));
     if (ImGui::BeginPopup("CompilerSelectPopup")) {
-        if (!has_compilers) {
-            ImGui::MenuItem("No compiler detected on PATH", nullptr, false, false);
+        if (merged_toolchains.empty()) {
+            ImGui::MenuItem("No compiler or toolchain detected", nullptr, false, false);
         } else {
-            if (!saved_compiler_found && !current_compiler.empty()) {
-                std::string missing_item = current_compiler + " (not found)";
+            if (tc_res.isFallback && !tc_res.requestedName.empty()) {
+                std::string missing_item = tc_res.requestedName + " (not found -> fallback: " + tc_res.profile.name + ")";
                 ImGui::MenuItem(missing_item.c_str(), nullptr, false, false);
                 ImGui::Separator();
             }
-            for (const auto& comp : detected_compilers) {
-                const bool is_selected = (comp.name == current_compiler);
-                std::string item_label = std::string(is_selected ? ICON_FA_CHECK "  " : "     ") + comp.name;
+            for (size_t ti = 0; ti < merged_toolchains.size(); ++ti) {
+                const auto& tc = merged_toolchains[ti];
+                const bool is_selected = (tc.name == tc_res.profile.name);
+                std::string suffix;
+                if (tc.isProjectLocal) suffix = " [project]";
+                else if (!tc.detected) suffix = " [user]";
+                else if (!tc.targetTriple.empty() && tc.targetTriple.find("mingw") == std::string::npos && tc.targetTriple.find("msvc") == std::string::npos) suffix = " [cross]";
+                std::string item_label = std::string(is_selected ? ICON_FA_CHECK "  " : "     ") + tc.name + suffix;
+                ImGui::PushID(static_cast<int>(ti));
                 if (ImGui::MenuItem(item_label.c_str(), nullptr, false)) {
-                    project.SetCompiler(comp.name);
+                    project.SetToolchain(tc.name);
                 }
-                Theme::Tooltip(("Compiler binary:\n" + comp.executable_path.generic_u8string()).c_str());
+                std::string tip = "Family: " + core::ToolchainFamilyToString(tc.family)
+                                + "\nC++: " + tc.cxx
+                                + (tc.targetTriple.empty() ? "" : ("\nTriple: " + tc.targetTriple))
+                                + (tc.sysroot.empty() ? "" : ("\nSysroot: " + tc.sysroot))
+                                + "\nLink with: " + tc.linkWith;
+                Theme::Tooltip(tip.c_str());
+                ImGui::PopID();
             }
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_GEAR "  Manage toolchains...")) {
+            OpenToolchainManagerModal();
         }
         ImGui::EndPopup();
     }
@@ -632,15 +907,20 @@ void RenderToolBar(
     // 3. Build / Rebuild / Clean Split Button (Spec §5.1.5)
     const bool is_building = build_runner.IsRunning();
     const bool is_scanning = project.IsScanning();
-    const bool list_empty = project.GetFiles().empty();
+    const bool list_empty = project.GetFiles().empty() && (core::TrustStore::CountCustomCommands(project) == 0);
     const bool has_missing = project.HasMissingFiles();
-    const bool compiler_valid = has_compilers && (compiler_manager.FindCompiler(project.GetCompiler()) != nullptr);
+    const bool compiler_valid = has_compilers && tc_res.found;
     const bool can_build = !is_building && !is_scanning && !list_empty && !has_missing && compiler_valid;
 
     if (is_building) {
         int elapsed_s = static_cast<int>(build_runner.GetElapsedSeconds());
-        std::string build_label = "Building... " + std::to_string(elapsed_s) + "s";
-        Theme::DisabledButton(build_label.c_str(), ImVec2(build_btn_w, build_btn_h), ImVec4(1.0f, 1.0f, 1.0f, 1.0f), Theme::Col::Warning, Theme::Col::Border, ImDrawFlags_RoundCornersLeft);
+        std::string stop_label = std::string(ICON_FA_XMARK) + " Stop " + std::to_string(elapsed_s) + "s";
+        ImGui::PushStyleColor(ImGuiCol_Button, Theme::Col::Danger);
+        bool stop_bld = Theme::Button(stop_label.c_str(), "Cancel running build and kill child process trees (Ctrl+Break)", false, ImVec2(build_btn_w, build_btn_h));
+        ImGui::PopStyleColor();
+        if (stop_bld) {
+            build_runner.CancelBuild();
+        }
     } else if (is_scanning) {
         std::string scan_label = std::string(ICON_FA_SPINNER) + " Scanning...";
         Theme::DisabledButton(scan_label.c_str(), ImVec2(build_btn_w, build_btn_h), Theme::Col::TextDim, Theme::Col::Button, Theme::Col::Border, ImDrawFlags_RoundCornersLeft);
@@ -688,11 +968,14 @@ void RenderToolBar(
                 }
             }
             if (ImGui::BeginMenu("     Build target")) {
-                for (const auto& t : targets) {
+                for (size_t ti = 0; ti < targets.size(); ++ti) {
+                    const auto& t = targets[ti];
                     std::string t_lbl = t.name + " (" + core::TargetKindToString(t.kind) + ")";
+                    ImGui::PushID(static_cast<int>(ti));
                     if (ImGui::MenuItem(t_lbl.c_str(), nullptr, false, can_build)) {
                         TriggerBuildWithGuard(project, compiler_manager, build_runner, build_start_error, output_lines, t.name);
                     }
+                    ImGui::PopID();
                 }
                 ImGui::EndMenu();
             }
@@ -715,9 +998,65 @@ void RenderToolBar(
         }
         Theme::Tooltip("Delete compiled object files and target binary for active configuration");
 
+        ImGui::Separator();
+        bool keep_going = project.GetKeepGoing();
+        if (ImGui::MenuItem("     Keep going on errors", nullptr, keep_going, !is_building)) {
+            project.SetKeepGoing(!keep_going);
+        }
+        Theme::Tooltip("Continue compiling independent files/targets after a compile error");
+
+        if (ImGui::MenuItem(ICON_FA_FILE_CODE "  Export compile_commands.json", nullptr, false, has_project)) {
+            auto ex = core::CompDbManager::ExportCompileCommands(project, compiler_manager);
+            core::OutLine ol;
+            ol.kind = core::OutLineKind::Status;
+            if (ex.success) {
+                ol.text = "Exported " + std::to_string(ex.entryCount) + " compile_commands.json entries (" + ex.outputPath.generic_u8string() + ")";
+            } else {
+                ol.text = "compile_commands.json export failed: " + ex.error;
+                ol.has_error = true;
+            }
+            output_lines.push_back(std::move(ol));
+        }
+        Theme::Tooltip("Write compile_commands.json for clangd/VS Code without building");
+
         ImGui::EndPopup();
     }
     ImGui::PopStyleVar(2);
+
+    // 4. Run / Stop + Optional Debug Button (V2-16)
+    if (run_runner != nullptr) {
+        ImGui::SameLine(0.0f, Theme::Sp::S2);
+        const bool is_running_proc = run_runner->IsRunning();
+        const bool has_run_cmd = (startup_tgt != nullptr && !startup_tgt->run.command.empty());
+        if (is_running_proc) {
+            ImGui::PushStyleColor(ImGuiCol_Button, Theme::Col::Danger);
+            bool stop_clicked = Theme::Button(ICON_FA_XMARK " Stop", "Stop running target / emulator (Ctrl+R)", false, ImVec2(run_btn_w, build_btn_h));
+            ImGui::PopStyleColor();
+            if (stop_clicked) {
+                run_runner->Stop();
+            }
+        } else if (!has_project || !has_run_cmd || is_building || is_scanning) {
+            Theme::DisabledButton(ICON_FA_PLAY " Run", ImVec2(run_btn_w, build_btn_h), Theme::Col::TextDim, Theme::Col::Button, Theme::Col::Border);
+            Theme::Tooltip(!has_project ? "Open a project first" : (!has_run_cmd ? "Configure a Run command in Build Settings -> Run / Debug" : "Wait for active build/scan to finish"));
+        } else {
+            if (Theme::SuccessButton(ICON_FA_PLAY " Run", "Run startup target / emulator (Ctrl+R)", ImVec2(run_btn_w, build_btn_h))) {
+                if (run_lines && run_start_error) {
+                    TriggerRunWithGuard(project, compiler_manager, build_runner, build_start_error, output_lines, *run_runner, *run_lines, *run_start_error, false);
+                }
+            }
+        }
+
+        if (has_debug_btn) {
+            ImGui::SameLine(0.0f, Theme::Sp::S1);
+            if (is_running_proc || is_building || is_scanning) {
+                Theme::DisabledButton("Debug", ImVec2(debug_btn_w, build_btn_h), Theme::Col::TextDim, Theme::Col::Button, Theme::Col::Border);
+            } else if (Theme::Button("Debug", "Launch configured debug command", false, ImVec2(debug_btn_w, build_btn_h))) {
+                if (run_lines && run_start_error) {
+                    TriggerRunWithGuard(project, compiler_manager, build_runner, build_start_error, output_lines, *run_runner, *run_lines, *run_start_error, true);
+                }
+            }
+        }
+    }
 
     // Huge-list warning confirmation modal (Spec §3.7)
     if (s_ShowLargeBuildModal) {
@@ -789,10 +1128,10 @@ void RenderToolBar(
         ImGui::OpenPopup("Build in Progress##ExitModal");
     }
     bool exit_close_x = false;
-    if (Theme::BeginModal("Build in Progress##ExitModal", "Build in Progress", ICON_FA_TRIANGLE_EXCLAMATION, Theme::Col::Warning, 420.0f, &exit_close_x)) {
-        ImGui::TextColored(Theme::Col::Text, "A compiler process is currently running.");
+    if (Theme::BeginModal("Build in Progress##ExitModal", "Stop build and quit?", ICON_FA_TRIANGLE_EXCLAMATION, Theme::Col::Warning, 420.0f, &exit_close_x)) {
+        ImGui::TextColored(Theme::Col::Text, "A build is currently running.");
         ImGui::Spacing();
-        ImGui::TextColored(Theme::Col::TextDim, "Exiting now will cancel the active build.");
+        ImGui::TextColored(Theme::Col::TextDim, "Stop active compiler processes and exit, or keep building?");
 
         ImGui::Spacing();
         ImGui::Spacing();
@@ -802,22 +1141,422 @@ void RenderToolBar(
         const float dpi = Theme::DpiScale;
         const float btn_h = Theme::Btn::DefaultH;
         const float keep_w = 136.0f * dpi;
-        const float exit_w = 96.0f * dpi;
+        const float exit_w = 108.0f * dpi;
         const float right_end = 420.0f * dpi - Theme::Sp::S4;
 
         ImGui::SetCursorPosX(right_end - keep_w - Theme::Sp::S2 - exit_w);
-        if (Theme::Button("Exit anyway", "Abort running build and exit", false, ImVec2(exit_w, btn_h))) {
+        ImGui::PushStyleColor(ImGuiCol_Button, Theme::Col::Danger);
+        bool stop_quit = Theme::Button("Stop & quit", "Terminate running build processes and exit immediately", false, ImVec2(exit_w, btn_h));
+        ImGui::PopStyleColor();
+        if (stop_quit) {
+            build_runner.CancelBuild();
             s_ShowExitWhileBuildingModal = false;
             ImGui::CloseCurrentPopup();
             glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
 
         ImGui::SameLine(0.0f, Theme::Sp::S2);
-        if (Theme::Button("Continue building", "Keep build running", true, ImVec2(keep_w, btn_h)) || exit_close_x) {
+        if (Theme::Button("Keep building", "Keep build running", true, ImVec2(keep_w, btn_h)) || exit_close_x) {
             s_ShowExitWhileBuildingModal = false;
             ImGui::CloseCurrentPopup();
         }
 
+        Theme::EndModal();
+    }
+
+    // Trust prompt on first open of a project with custom build steps (V2-6 security)
+    if (has_project && !project.IsScanning()) {
+        std::string cur_root_str = project.GetRootPath().generic_u8string();
+        if (cur_root_str != s_PromptedTrustRoot) {
+            s_PromptedTrustRoot = cur_root_str;
+            if (core::TrustStore::CountCustomCommands(project) > 0 && !core::TrustStore::IsTrusted(project.GetRootPath())) {
+                s_TrustPendingBuild = false;
+                s_TrustPendingRebuild = false;
+                s_TrustPendingTarget.clear();
+                s_ShowTrustModal = true;
+            }
+        }
+    }
+
+    if (s_ShowTrustModal) {
+        ImGui::OpenPopup("Trust Project Folder##Modal");
+    }
+    bool trust_close_x = false;
+    if (Theme::BeginModal("Trust Project Folder##Modal", "Trust Project Folder?", ICON_FA_TRIANGLE_EXCLAMATION, Theme::Col::Warning, 520.0f, &trust_close_x)) {
+        size_t cmd_count = core::TrustStore::CountCustomCommands(project);
+        ImGui::TextWrapped("This project runs %zu custom command(s) during builds. Trust this folder?", cmd_count);
+        ImGui::Spacing();
+        ImGui::TextColored(Theme::Col::TextDim, "%s", project.GetRootPath().generic_u8string().c_str());
+        ImGui::Spacing();
+
+        ImGui::BeginChild("TrustCmdPreview", ImVec2(0.0f, 130.0f * Theme::DpiScale), true);
+        ImGui::PushFont(g_Fonts.mono);
+        for (const auto& t : project.GetTargets()) {
+            for (const auto& st : t.steps) {
+                ImGui::TextColored(Theme::Col::Accent, "[%s / %s]", t.name.c_str(), st.name.c_str());
+                ImGui::SameLine();
+                ImGui::TextUnformatted(st.command.c_str());
+            }
+        }
+        ImGui::PopFont();
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        ImGui::TextColored(Theme::Col::TextDim, "Untrusted projects can be browsed, but cannot be built.");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        const float dpi = Theme::DpiScale;
+        const float btn_h = Theme::Btn::DefaultH;
+        if (Theme::Button("Don't Trust (Browse Only)", "Keep folder untrusted and cancel build", false, ImVec2(0.0f, btn_h)) || trust_close_x) {
+            s_ShowTrustModal = false;
+            s_TrustPendingBuild = false;
+            s_TrustPendingRebuild = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (Theme::SuccessButton("Trust Folder", "Store trust in %APPDATA%/GenieBuild/trust.json", ImVec2(0.0f, btn_h))) {
+            core::TrustStore::SetTrusted(project.GetRootPath(), true);
+            s_ShowTrustModal = false;
+            ImGui::CloseCurrentPopup();
+            if (s_TrustPendingBuild) {
+                s_TrustPendingBuild = false;
+                TriggerBuildWithGuard(project, compiler_manager, build_runner, build_start_error, output_lines, s_TrustPendingTarget);
+            } else if (s_TrustPendingRebuild) {
+                s_TrustPendingRebuild = false;
+                TriggerRebuildWithGuard(project, compiler_manager, build_runner, build_start_error, output_lines, s_TrustPendingTarget);
+            }
+        }
+        Theme::EndModal();
+    }
+
+    // Running Executable Conflict Modal on Windows (V2-16)
+    if (s_ShowRunningExeConflictModal) {
+        ImGui::OpenPopup("Running Executable Conflict##Modal");
+    }
+    bool conflict_close_x = false;
+    if (Theme::BeginModal("Running Executable Conflict##Modal", "Target Binary In Use", ICON_FA_TRIANGLE_EXCLAMATION, Theme::Col::Warning, 470.0f, &conflict_close_x)) {
+        ImGui::TextWrapped("Target binary is currently running and locked by Windows:");
+        ImGui::Spacing();
+        ImGui::TextColored(Theme::Col::TextDim, "%s", s_ConflictExePath.c_str());
+        ImGui::Spacing();
+        ImGui::TextWrapped("Stop the running process so linking can overwrite the executable?");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        const float btn_h = Theme::Btn::DefaultH;
+        if (Theme::Button("Cancel##RunConflict", "Keep running and cancel build", false, ImVec2(100.0f * Theme::DpiScale, btn_h)) || conflict_close_x) {
+            s_ShowRunningExeConflictModal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, Theme::Col::Danger);
+        bool stop_build_clicked = Theme::Button("Stop & build", "Terminate running process and start build", false, ImVec2(130.0f * Theme::DpiScale, btn_h));
+        ImGui::PopStyleColor();
+        if (stop_build_clicked) {
+            if (s_ActiveRunRunner) {
+                s_ActiveRunRunner->Stop();
+            }
+            s_ShowRunningExeConflictModal = false;
+            ImGui::CloseCurrentPopup();
+            if (s_ConflictIsRebuild) {
+                TriggerRebuildWithGuard(project, compiler_manager, build_runner, build_start_error, output_lines, s_ConflictTarget);
+            } else {
+                TriggerBuildWithGuard(project, compiler_manager, build_runner, build_start_error, output_lines, s_ConflictTarget);
+            }
+        }
+        Theme::EndModal();
+    }
+
+    // Slim dismissible banners for VS-found (V2-17), Toolchain Fallback (V2-14), and Freestanding-on-PE (V2-15)
+    {
+        std::string vs_banner = core::MsvcEnvDetector::GetReadyBannerText(compiler_manager.GetMsvcEnvState());
+        bool has_msvc_active = (tc_res.profile.family == core::ToolchainFamily::Msvc || tc_res.profile.family == core::ToolchainFamily::ClangCl);
+        bool show_vs = has_project && !vs_banner.empty() && !has_msvc_active;
+
+        std::string fb_key = tc_res.requestedName + "->" + tc_res.profile.name;
+        bool show_fb = has_project && tc_res.isFallback && !tc_res.bannerMessage.empty() && (s_DismissedFallbackKey != fb_key);
+
+        bool any_freestanding = false;
+        for (const auto& t : project.GetTargets()) {
+            if (t.freestanding) {
+                any_freestanding = true;
+                break;
+            }
+        }
+        std::string pe_key = tc_res.profile.name;
+        bool show_pe = has_project && any_freestanding && (tc_res.profile.os == "windows") && (s_DismissedPeWarnKey != pe_key);
+
+        if (!s_LongPathsChecked) {
+            s_LongPathsEnabledCached = core::fs_util::IsWindowsLongPathsEnabled();
+            s_LongPathsChecked = true;
+        }
+        bool deep_root = has_project && (project.GetRootPath().generic_u8string().size() >= 150);
+        static core::UserSettings s_BannerPrefs;
+        static bool s_BannerPrefsLoaded = false;
+        if (!s_BannerPrefsLoaded) {
+            s_BannerPrefs = core::HintsManager::LoadUserSettings();
+            s_BannerPrefsLoaded = true;
+        }
+        bool show_lp = deep_root && !s_LongPathsEnabledCached && !s_BannerPrefs.longPathBannerDismissed;
+        bool show_def = has_project && !s_DismissedDefenderSession &&
+                        (build_runner.GetStatus() == core::BuildStatus::Finished) &&
+                        build_runner.GetLastResult().defender_hint_recommended;
+
+        if (show_vs || show_fb || show_pe || show_lp || show_def || s_ShowImportChecklistBanner) {
+            const ImGuiViewport* vp = ImGui::GetMainViewport();
+            const float banner_x = vp->WorkPos.x + Theme::Sp::S3;
+            const float banner_y = vp->WorkPos.y + Theme::TitleBarHeight + Theme::ToolBarHeight + 4.0f * Theme::DpiScale;
+            ImGui::SetNextWindowPos(ImVec2(banner_x, banner_y), ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.95f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * Theme::DpiScale, 6.0f * Theme::DpiScale));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, Theme::CardRounding);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, Theme::Col::BgExplorer);
+            ImGui::PushStyleColor(ImGuiCol_Border, Theme::Col::Border);
+            ImGuiWindowFlags bflags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+            if (ImGui::Begin("##ToolchainBannersStrip", nullptr, bflags)) {
+                if (show_vs) {
+                    ImGui::TextColored(Theme::Col::Accent, "%s", vs_banner.c_str());
+                    ImGui::SameLine(0.0f, Theme::Sp::S2);
+                    if (Theme::Button("Use MSVC##UseMsvc", "Switch project toolchain to detected MSVC", true, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        for (const auto& tc : merged_toolchains) {
+                            if (tc.family == core::ToolchainFamily::Msvc) {
+                                project.SetToolchain(tc.name);
+                                break;
+                            }
+                        }
+                        compiler_manager.DismissMsvcBanner();
+                    }
+                    ImGui::SameLine(0.0f, Theme::Sp::S1);
+                    if (Theme::Button("Dismiss##VsDis", "Dismiss VS notification", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        compiler_manager.DismissMsvcBanner();
+                    }
+                }
+                if (show_fb) {
+                    ImGui::TextColored(Theme::Col::Warning, "%s", tc_res.bannerMessage.c_str());
+                    ImGui::SameLine(0.0f, Theme::Sp::S2);
+                    if (Theme::Button("Manage Toolchains...##FbMgr", "Open Toolchain Manager", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        OpenToolchainManagerModal();
+                    }
+                    ImGui::SameLine(0.0f, Theme::Sp::S1);
+                    if (Theme::Button("Dismiss##FbDis", "Dismiss banner", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        s_DismissedFallbackKey = fb_key;
+                    }
+                }
+                if (show_pe) {
+                    ImGui::TextColored(Theme::Col::Warning, "Kernel targets ELF/multiboot, but '%s' produces Windows PE. Select an x86_64-elf / i686-elf cross toolchain.", tc_res.profile.name.c_str());
+                    ImGui::SameLine(0.0f, Theme::Sp::S2);
+                    if (Theme::Button("Manage Toolchains...##PeMgr", "Open Toolchain Manager", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        OpenToolchainManagerModal();
+                    }
+                    ImGui::SameLine(0.0f, Theme::Sp::S1);
+                    if (Theme::Button("Dismiss##PeDis", "Dismiss warning", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        s_DismissedPeWarnKey = pe_key;
+                    }
+                }
+                if (show_lp) {
+                    ImGui::TextColored(Theme::Col::Warning, "Windows LongPathsEnabled is 0. GenieBuild shortens object paths automatically, or enable system long paths.");
+                    ImGui::SameLine(0.0f, Theme::Sp::S2);
+                    if (Theme::Button("How to Enable##LpHow", "Show exact Windows Long Paths instructions", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        s_ShowLongPathHelpModal = true;
+                    }
+                    ImGui::SameLine(0.0f, Theme::Sp::S1);
+                    if (Theme::Button("Dismiss##LpDis", "Don't show long-path banner again", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        s_BannerPrefs.longPathBannerDismissed = true;
+                        core::HintsManager::SaveUserSettings(s_BannerPrefs);
+                    }
+                }
+                if (show_def) {
+                    ImGui::TextColored(Theme::Col::Warning, "Builds may be slowed by antivirus scanning. You can exclude .geniebuild/ or use a Dev Drive.");
+                    ImGui::SameLine(0.0f, Theme::Sp::S2);
+                    if (Theme::Button("Learn how##DefHow", "Show PowerShell exclusion command & Dev Drive info", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        s_ShowDefenderHelpModal = true;
+                    }
+                    ImGui::SameLine(0.0f, Theme::Sp::S1);
+                    if (Theme::Button("Don't show again##DefDis", "Dismiss Defender hint for this project", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        core::HintsManager::DismissDefenderForProject(project.GetRootPath(), false);
+                        s_DismissedDefenderSession = true;
+                    }
+                }
+                if (s_ShowImportChecklistBanner) {
+                    ImGui::TextColored(Theme::Col::Accent, "Imported project.json: set target kinds, dependencies, and libraries in Settings, then build.");
+                    ImGui::SameLine(0.0f, Theme::Sp::S2);
+                    if (Theme::Button("Open Settings##ImpSet", "Review imported targets", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        OpenBuildSettingsModal();
+                    }
+                    ImGui::SameLine(0.0f, Theme::Sp::S1);
+                    if (Theme::Button("Dismiss##ImpDis", "Dismiss checklist banner", false, ImVec2(0.0f, Theme::Btn::SmallH))) {
+                        s_ShowImportChecklistBanner = false;
+                    }
+                }
+            }
+            ImGui::End();
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(2);
+        }
+    }
+
+    // V2-22 Long Paths Help Modal
+    if (s_ShowLongPathHelpModal) ImGui::OpenPopup("Enable Windows Long Paths##Modal");
+    bool lp_close = false;
+    if (Theme::BeginModal("Enable Windows Long Paths##Modal", "Enable Windows Long Paths", ICON_FA_TRIANGLE_EXCLAMATION, Theme::Col::Warning, 540.0f, &lp_close)) {
+        ImGui::TextWrapped("To enable Win32 long paths system-wide (admin PowerShell command to run yourself):");
+        ImGui::Spacing();
+        const char* lp_cmd = "New-ItemProperty -Path \"HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\" -Name \"LongPathsEnabled\" -Value 1 -PropertyType DWORD -Force";
+        ImGui::PushFont(g_Fonts.mono);
+        ImGui::TextWrapped("%s", lp_cmd);
+        ImGui::PopFont();
+        ImGui::Spacing();
+        if (Theme::Button("Copy PowerShell Command##LpCopy", "Copy command to clipboard", false, ImVec2(0.0f, Theme::Btn::DefaultH))) {
+            ImGui::SetClipboardText(lp_cmd);
+        }
+        ImGui::SameLine();
+        if (Theme::Button("Close##LpClose", "Close", true, ImVec2(90.0f * Theme::DpiScale, Theme::Btn::DefaultH)) || lp_close) {
+            s_ShowLongPathHelpModal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        Theme::EndModal();
+    }
+
+    // V2-23 Windows Defender Help Modal
+    if (s_ShowDefenderHelpModal) ImGui::OpenPopup("Antivirus Performance Hint##Modal");
+    bool def_close = false;
+    if (Theme::BeginModal("Antivirus Performance Hint##Modal", "Speed Up Builds on Windows", ICON_FA_TRIANGLE_EXCLAMATION, Theme::Col::Warning, 560.0f, &def_close)) {
+        std::string gb_dir = (project.GetRootPath() / ".geniebuild").generic_u8string();
+        std::string ps_cmd = "Add-MpPreference -ExclusionPath \"" + gb_dir + "\"";
+        ImGui::TextWrapped("Real-time scanning of intermediate .o/.obj/.pch writes can slow large builds. GenieBuild never changes security settings automatically; run this in an admin PowerShell or move your repo onto a Windows Dev Drive (ReFS):");
+        ImGui::Spacing();
+        ImGui::PushFont(g_Fonts.mono);
+        ImGui::TextWrapped("%s", ps_cmd.c_str());
+        ImGui::PopFont();
+        ImGui::Spacing();
+        if (Theme::Button("Copy PowerShell Command##DefCopy", "Copy exclusion command", false, ImVec2(0.0f, Theme::Btn::DefaultH))) {
+            ImGui::SetClipboardText(ps_cmd.c_str());
+        }
+        ImGui::SameLine();
+        if (Theme::Button("Don't show for any project", "Suppress hint globally", false, ImVec2(0.0f, Theme::Btn::DefaultH))) {
+            core::HintsManager::DismissDefenderForProject(project.GetRootPath(), true);
+            s_DismissedDefenderSession = true;
+            s_ShowDefenderHelpModal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (Theme::Button("Close##DefClose", "Close", true, ImVec2(90.0f * Theme::DpiScale, Theme::Btn::DefaultH)) || def_close) {
+            s_ShowDefenderHelpModal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        Theme::EndModal();
+    }
+
+    // V2-24 Import compile_commands.json Modal
+    if (s_ShowImportModal) ImGui::OpenPopup("Import compile_commands.json##Modal");
+    bool imp_close = false;
+    if (Theme::BeginModal("Import compile_commands.json##Modal", "Import from compile_commands.json", ICON_FA_CODE, Theme::Col::Accent, 780.0f, &imp_close)) {
+        const float dpi = Theme::DpiScale;
+        ImGui::TextColored(Theme::Col::TextDim, "Project root:");
+        ImGui::SameLine();
+        char rbuf[512];
+        std::strncpy(rbuf, s_ImportRootBuf.c_str(), sizeof(rbuf) - 1);
+        rbuf[sizeof(rbuf) - 1] = '\0';
+        ImGui::SetNextItemWidth(std::max(180.0f * dpi, ImGui::GetContentRegionAvail().x - 160.0f * dpi));
+        if (ImGui::InputText("##ImpRoot", rbuf, sizeof(rbuf))) {
+            s_ImportRootBuf = rbuf;
+        }
+        ImGui::SameLine();
+        if (Theme::Button("Re-analyze##ImpRe", "Re-analyze with new project root", false, ImVec2(0.0f, Theme::Btn::DefaultH))) {
+            s_ImportPlan = core::CompDbManager::AnalyzeCompileCommands(s_ImportPlan.compdbPath, std::filesystem::u8path(s_ImportRootBuf));
+            s_ImportSelectedTarget = 0;
+        }
+
+        if (!s_ImportPlan.success) {
+            ImGui::TextColored(Theme::Col::Error, "%s", s_ImportPlan.error.c_str());
+        } else {
+            ImGui::TextColored(Theme::Col::TextDim, "Parsed %zu entries -> %zu suggested targets (%zu generated excluded).",
+                s_ImportPlan.totalEntriesParsed, s_ImportPlan.targets.size(), s_ImportPlan.excludedGeneratedCount);
+
+            // Left: targets list
+            ImGui::BeginChild("ImpTargetsLeft", ImVec2(240.0f * dpi, 320.0f * dpi), true);
+            for (size_t i = 0; i < s_ImportPlan.targets.size(); ++i) {
+                const auto& ts = s_ImportPlan.targets[i];
+                std::string lbl = ts.name + " (" + core::TargetKindToString(ts.kind) + ", " + std::to_string(ts.files.size()) + " files)";
+                if (ImGui::Selectable((lbl + "##impt" + std::to_string(i)).c_str(), s_ImportSelectedTarget == static_cast<int>(i))) {
+                    s_ImportSelectedTarget = static_cast<int>(i);
+                }
+            }
+            ImGui::EndChild();
+            ImGui::SameLine(0.0f, Theme::Sp::S2);
+
+            // Right: selected target & factored flags preview
+            ImGui::BeginChild("ImpTargetRight", ImVec2(0.0f, 320.0f * dpi), true);
+            if (s_ImportSelectedTarget >= 0 && s_ImportSelectedTarget < static_cast<int>(s_ImportPlan.targets.size())) {
+                auto& ts = s_ImportPlan.targets[static_cast<size_t>(s_ImportSelectedTarget)];
+                char nbuf[128];
+                std::strncpy(nbuf, ts.name.c_str(), sizeof(nbuf) - 1);
+                nbuf[sizeof(nbuf) - 1] = '\0';
+                ImGui::TextColored(Theme::Col::TextDim, "Target name:");
+                ImGui::SetNextItemWidth(220.0f * dpi);
+                if (ImGui::InputText("##ImpTName", nbuf, sizeof(nbuf))) ts.name = nbuf;
+
+                const char* kind_items[] = { "executable", "static", "shared", "interface" };
+                int kidx = static_cast<int>(ts.kind);
+                ImGui::TextColored(Theme::Col::TextDim, "Target kind:");
+                ImGui::SetNextItemWidth(180.0f * dpi);
+                if (ImGui::Combo("##ImpTKind", &kidx, kind_items, 4)) {
+                    ts.kind = static_cast<core::TargetKind>(kidx);
+                }
+
+                ImGui::Separator();
+                ImGui::TextColored(Theme::Col::Text, "Factored Project Includes (%zu), Defines (%zu), Flags (%zu)",
+                    s_ImportPlan.projectIncludeDirs.size(), s_ImportPlan.projectDefines.size(), s_ImportPlan.projectCompileFlags.size());
+                ImGui::TextColored(Theme::Col::Text, "Target Includes (%zu), Defines (%zu), Flags (%zu), Folder groups (%zu)",
+                    ts.includeDirs.size(), ts.defines.size(), ts.compileFlags.size(), ts.folders.size());
+                for (const auto& inc : ts.includeDirs) {
+                    ImGui::TextColored(Theme::Col::TextDim, "  -I %s", inc.c_str());
+                }
+                for (const auto& fg : ts.folders) {
+                    if (!fg.includeDirs.empty() || !fg.defines.empty() || !fg.compileFlags.empty()) {
+                        ImGui::TextColored(Theme::Col::Accent, "  [override %s] +%zu inc, +%zu def, +%zu flags",
+                            fg.folderRel.c_str(), fg.includeDirs.size(), fg.defines.size(), fg.compileFlags.size());
+                    }
+                }
+            }
+            ImGui::EndChild();
+
+            if (!s_ImportPlan.warningsList.empty()) {
+                ImGui::BeginChild("ImpWarnings", ImVec2(0.0f, 68.0f * dpi), true);
+                for (const auto& w : s_ImportPlan.warningsList) {
+                    ImGui::TextColored(Theme::Col::Warning, "! %s", w.c_str());
+                }
+                ImGui::EndChild();
+            }
+        }
+
+        if (!s_ImportWriteError.empty()) {
+            ImGui::TextColored(Theme::Col::Error, "%s", s_ImportWriteError.c_str());
+        }
+
+        if (Theme::Button("Cancel##ImpCancel", "Cancel import", false, ImVec2(90.0f * dpi, Theme::Btn::DefaultH)) || imp_close) {
+            s_ShowImportModal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (!s_ImportPlan.success) ImGui::BeginDisabled(true);
+        if (Theme::SuccessButton("Write project.json", "Backup existing project.json, write v2 project.json, and open", ImVec2(150.0f * dpi, Theme::Btn::DefaultH))) {
+            std::filesystem::path rpath = std::filesystem::u8path(s_ImportRootBuf);
+            if (core::CompDbManager::WriteImportedProject(s_ImportPlan, rpath, s_ImportWriteError)) {
+                project.Load(rpath);
+                RefreshFileTree();
+                output_lines.clear();
+                build_start_error.clear();
+                s_ShowImportModal = false;
+                s_ShowImportChecklistBanner = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        if (!s_ImportPlan.success) ImGui::EndDisabled();
         Theme::EndModal();
     }
 
@@ -828,14 +1567,17 @@ void RenderToolBar(
 void RenderTopBar(
     GLFWwindow* window,
     core::Project& project,
-    const core::CompilerManager& compiler_manager,
+    core::CompilerManager& compiler_manager,
     core::BuildRunner& build_runner,
     std::string& build_start_error,
-    std::vector<core::OutLine>& output_lines
+    std::vector<core::OutLine>& output_lines,
+    core::RunRunner* run_runner,
+    std::vector<core::OutLine>* run_lines,
+    std::string* run_start_error
 ) {
     RenderTitleBar(window, project);
     ImGui::Spacing();
-    RenderToolBar(window, project, compiler_manager, build_runner, build_start_error, output_lines);
+    RenderToolBar(window, project, compiler_manager, build_runner, build_start_error, output_lines, run_runner, run_lines, run_start_error);
 }
 
 } // namespace ui

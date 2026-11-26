@@ -2,6 +2,7 @@
 #include "top_bar.h"
 #include "build_settings_modal.h"
 #include "source_rules.h"
+#include "tool_registry.h"
 #include "theme.h"
 #include "icons.h"
 #include "tree_view.h"
@@ -60,6 +61,7 @@ static std::string NormalizePath(const std::string& path_str) {
 }
 
 static bool ClassifyFile(const std::filesystem::path& path, FileNodeType& out_type, bool& out_is_c) {
+    const std::string pstr = path.generic_u8string();
     const std::string ext = ToLower(path.extension().generic_u8string());
 
     if (ext == ".c") {
@@ -67,16 +69,19 @@ static bool ClassifyFile(const std::filesystem::path& path, FileNodeType& out_ty
         out_is_c = true;
         return true;
     }
-    if (ext == ".cpp" || ext == ".cc" || ext == ".cxx") {
+    if (ext == ".cpp" || ext == ".cc" || ext == ".cxx" ||
+        ext == ".rc" || ext == ".s" || ext == ".asm" || ext == ".cu" || ext == ".ispc") {
         out_type = FileNodeType::SourceFile;
         out_is_c = false;
         return true;
     }
-    if (ext == ".h" || ext == ".hpp" || ext == ".hh" || ext == ".hxx") {
+    if (ext == ".h" || ext == ".hpp" || ext == ".hh" || ext == ".hxx" ||
+        ext == ".cuh" || ext == ".ispc.h") {
         out_type = FileNodeType::HeaderFile;
         out_is_c = false;
         return true;
     }
+    (void)pstr;
     return false;
 }
 
@@ -171,8 +176,7 @@ static void CollectSourcesInFolder(const std::filesystem::path& folder_path, con
     std::filesystem::recursive_directory_iterator end;
 
     auto is_source_file = [](const std::filesystem::path& p) {
-        std::string ext = ToLower(p.extension().generic_u8string());
-        return (ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".cxx");
+        return core::ToolRegistry::ClassifySourceFile(p.generic_u8string()) != core::SourceFileKind::Unknown;
     };
 
     while (it != end && !ec) {
@@ -470,6 +474,7 @@ static void FlattenNode(
         if (node.type == FileNodeType::SourceFile) {
             row.type = TreeRowType::SourceFile;
             row.is_c = node.is_c_source;
+            PopulateTreeRowTypeBadge(row, project.GetCustomTools());
             const auto& files_set = project.GetFilesSet();
             row.in_build = (files_set.find(node.rel_path) != files_set.end());
             if (row.in_build) {

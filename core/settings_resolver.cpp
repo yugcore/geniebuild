@@ -1,6 +1,7 @@
 #include "settings_resolver.h"
 #include "project.h"
 #include "compiler.h"
+#include "condition.h"
 
 #include <algorithm>
 #include <cctype>
@@ -441,21 +442,20 @@ EffectiveFileSettings ResolveFileSettings(
     bool is_c_source
 ) {
     (void)is_c_source;
-    std::string comp_low = ToLowerRes(compiler_name);
-    std::string comp_family = "gcc";
-    if (comp_low == "cl" || comp_low == "cl.exe") comp_family = "msvc";
-    else if (comp_low.find("clang") != std::string::npos) comp_family = "clang";
-#if defined(_WIN32)
-    const std::string os_name = "windows";
-#elif defined(__APPLE__)
-    const std::string os_name = "macos";
-#else
-    const std::string os_name = "linux";
-#endif
+    ConditionContext cond_ctx = BuildConditionContext(project);
+    if (!config_name.empty()) cond_ctx.config = config_name;
+    if (!compiler_name.empty()) {
+        std::string comp_low = ToLowerRes(compiler_name);
+        if (comp_low == "cl" || comp_low == "cl.exe") cond_ctx.compilerFamily = "msvc";
+        else if (comp_low == "clang-cl" || comp_low == "clangcl") cond_ctx.compilerFamily = "clangcl";
+        else if (comp_low.find("clang") != std::string::npos) cond_ctx.compilerFamily = "clang";
+        else cond_ctx.compilerFamily = "gcc";
+        cond_ctx.toolchain = compiler_name;
+    }
 
     std::vector<const FlagOverride*> matched;
     for (const auto& ov : target.overrides) {
-        if (!ov.condition.empty() && !EvaluateSimpleCondition(ov.condition, os_name, comp_family)) {
+        if (!ov.condition.empty() && !EvaluateCondition(ov.condition, cond_ctx).active) {
             continue;
         }
         CompiledGlob cg = CompiledGlob::Compile(ov.match);
@@ -477,17 +477,16 @@ std::unordered_map<std::string, std::shared_ptr<const EffectiveFileSettings>> Re
     const std::string& config_name,
     const std::string& compiler_name
 ) {
-    std::string comp_low = ToLowerRes(compiler_name);
-    std::string comp_family = "gcc";
-    if (comp_low == "cl" || comp_low == "cl.exe") comp_family = "msvc";
-    else if (comp_low.find("clang") != std::string::npos) comp_family = "clang";
-#if defined(_WIN32)
-    const std::string os_name = "windows";
-#elif defined(__APPLE__)
-    const std::string os_name = "macos";
-#else
-    const std::string os_name = "linux";
-#endif
+    ConditionContext cond_ctx = BuildConditionContext(project);
+    if (!config_name.empty()) cond_ctx.config = config_name;
+    if (!compiler_name.empty()) {
+        std::string comp_low = ToLowerRes(compiler_name);
+        if (comp_low == "cl" || comp_low == "cl.exe") cond_ctx.compilerFamily = "msvc";
+        else if (comp_low == "clang-cl" || comp_low == "clangcl") cond_ctx.compilerFamily = "clangcl";
+        else if (comp_low.find("clang") != std::string::npos) cond_ctx.compilerFamily = "clang";
+        else cond_ctx.compilerFamily = "gcc";
+        cond_ctx.toolchain = compiler_name;
+    }
 
     struct PrecompiledOv {
         const FlagOverride* ov = nullptr;
@@ -499,7 +498,7 @@ std::unordered_map<std::string, std::shared_ptr<const EffectiveFileSettings>> Re
     for (const auto& ov : target.overrides) {
         PrecompiledOv po;
         po.ov = &ov;
-        po.active = ov.condition.empty() || EvaluateSimpleCondition(ov.condition, os_name, comp_family);
+        po.active = ov.condition.empty() || EvaluateCondition(ov.condition, cond_ctx).active;
         if (po.active) {
             po.glob = CompiledGlob::Compile(ov.match);
         }
@@ -536,6 +535,12 @@ std::unordered_map<std::string, std::shared_ptr<const EffectiveFileSettings>> Re
 std::vector<std::string> ValidateTargetOverrides(const Target& target) {
     std::vector<std::string> warnings;
     for (const auto& ov : target.overrides) {
+        if (!ov.condition.empty()) {
+            std::string cerr;
+            if (!ValidateCondition(ov.condition, cerr)) {
+                warnings.push_back("Target '" + target.name + "' override '" + ov.match + "' has invalid condition '" + ov.condition + "': " + cerr);
+            }
+        }
         if (ov.match.empty()) {
             warnings.push_back("Target '" + target.name + "' has an override with an empty match pattern.");
             continue;
