@@ -47,8 +47,30 @@ std::wstring QuoteWin32Arg(const std::wstring& arg) {
     return out;
 }
 
+bool IsCmdExeProgram(const std::string& prog) {
+    std::string p = prog;
+    std::replace(p.begin(), p.end(), '\\', '/');
+    size_t sl = p.find_last_of('/');
+    std::string fname = (sl == std::string::npos) ? p : p.substr(sl + 1);
+    std::transform(fname.begin(), fname.end(), fname.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return fname == "cmd" || fname == "cmd.exe";
+}
+
 std::wstring BuildWin32CommandLine(const BuildCommand& cmd) {
     std::wstring cl = QuoteWin32Arg(fs_util::Utf8ToWide(cmd.program));
+    // cmd.exe /c strips only the first and last '"' without unescaping '\"',
+    // so shell commands with embedded quotes must be passed verbatim inside outer quotes.
+    if (IsCmdExeProgram(cmd.program) && cmd.arguments.size() == 2 &&
+        (cmd.arguments[0] == "/c" || cmd.arguments[0] == "/C")) {
+        cl.push_back(L' ');
+        cl += fs_util::Utf8ToWide(cmd.arguments[0]);
+        cl += L" \"";
+        cl += fs_util::Utf8ToWide(cmd.arguments[1]);
+        cl.push_back(L'"');
+        return cl;
+    }
     for (const auto& a : cmd.arguments) {
         cl.push_back(L' ');
         cl += QuoteWin32Arg(fs_util::Utf8ToWide(a));

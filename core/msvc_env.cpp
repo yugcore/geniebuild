@@ -21,15 +21,6 @@ std::string ToLowerMsvc(std::string s) {
     return s;
 }
 
-std::string TrimMsvc(std::string s) {
-    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) {
-        s.pop_back();
-    }
-    size_t i = 0;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
-    return s.substr(i);
-}
-
 std::string ExtractShortVersion(const std::string& full_ver) {
     size_t dot1 = full_ver.find('.');
     if (dot1 == std::string::npos) return full_ver;

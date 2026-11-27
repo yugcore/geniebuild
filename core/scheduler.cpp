@@ -115,6 +115,7 @@ double Scheduler::ComputeTargetMsPerByte(
     double total_bytes = 0.0;
     std::error_code ec;
 
+    size_t sampled = 0;
     for (const auto& f : target.GetCompiledFiles()) {
         std::string obj_key;
         std::filesystem::path obj_p = BuildRunner::ComputeObjectPath(project, obj_dir, f, is_msvc, obj_key);
@@ -124,6 +125,7 @@ double Scheduler::ComputeTargetMsPerByte(
             if (!ec && fsz > 0) {
                 total_ms += static_cast<double>(dur);
                 total_bytes += static_cast<double>(fsz);
+                if (++sampled >= 64) break;
             }
         }
     }

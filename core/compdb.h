@@ -35,6 +35,7 @@ struct ImportedTargetSuggestion {
     TargetKind kind = TargetKind::Executable;
     std::vector<std::string> deps;
     std::vector<std::string> libs;
+    std::vector<std::string> linkFlags;
     std::vector<std::string> files;
     std::vector<std::string> includeDirs;
     std::vector<std::string> systemIncludeDirs;
@@ -44,6 +45,7 @@ struct ImportedTargetSuggestion {
     std::string cStd;
     std::string warnings;
     std::vector<ImportedFolderGroup> folders;
+    std::vector<BuildStep> steps;
 };
 
 struct ImportPlan {
@@ -53,6 +55,7 @@ struct ImportPlan {
     std::filesystem::path projectRoot;
     size_t totalEntriesParsed = 0;
     size_t excludedGeneratedCount = 0;
+    size_t importedStepCount = 0;
 
     // Project-wide factored baseline flags
     std::vector<std::string> projectIncludeDirs;

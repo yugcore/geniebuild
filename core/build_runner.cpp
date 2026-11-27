@@ -60,8 +60,7 @@ static std::filesystem::path NormalizeForCompare(const std::filesystem::path& p)
     std::error_code ec;
     std::filesystem::path abs_p = p.is_absolute() ? p : std::filesystem::absolute(p, ec);
     if (ec) abs_p = p;
-    std::filesystem::path canon = std::filesystem::weakly_canonical(abs_p, ec);
-    std::filesystem::path norm = (!ec && !canon.empty()) ? canon : abs_p.lexically_normal();
+    std::filesystem::path norm = abs_p.lexically_normal();
 #if defined(_WIN32)
     std::string s = norm.generic_u8string();
     if (s.size() >= 2 && s[1] == ':' && std::isalpha(static_cast<unsigned char>(s[0]))) {
@@ -172,6 +171,23 @@ std::filesystem::path BuildRunner::ComputeObjectPath(
     std::string& out_obj_key
 ) {
     const std::string obj_ext = is_msvc ? ".obj" : ".o";
+    // Fast lexical path for clean relative project files (avoids path parsing + weakly_canonical on 50k builds)
+    if (!file_rel.empty() && file_rel[0] != '/' && file_rel[0] != '\\' &&
+        file_rel.find(':') == std::string::npos && file_rel.find('\\') == std::string::npos &&
+        file_rel.rfind("./", 0) != 0 && file_rel.find("..") == std::string::npos) {
+        std::string rel_obj = file_rel + obj_ext;
+        std::string obj_dir_s = obj_dir.generic_u8string();
+        if (obj_dir_s.size() + 1 + rel_obj.size() < 195) {
+            out_obj_key = rel_obj;
+            return std::filesystem::u8path(obj_dir_s + "/" + rel_obj);
+        }
+        std::filesystem::path safe = fs_util::ComputeSafeObjectPath(obj_dir, rel_obj, file_rel);
+        std::error_code rec;
+        std::filesystem::path safe_rel = std::filesystem::relative(safe, obj_dir, rec);
+        out_obj_key = (!rec && !safe_rel.empty()) ? safe_rel.generic_u8string() : rel_obj;
+        return safe;
+    }
+
     std::filesystem::path root_norm = NormalizeForCompare(project.GetRootPath());
     std::filesystem::path src_norm = NormalizeForCompare(project.ResolvePath(file_rel));
     std::filesystem::path rel = src_norm.lexically_relative(root_norm);
@@ -1035,6 +1051,8 @@ void BuildRunner::WorkerRun(
         std::unordered_map<std::string, std::string> current_state;
         std::vector<std::string> generated_sources;
         std::vector<std::filesystem::path> object_paths;
+        int64_t max_obj_mtime_ns = 0;
+        bool any_obj_missing = false;
         TargetPchAnalysis pch_analysis;
         UnityPlan unity_plan;
         size_t compiled_task_count = 0;
@@ -1514,10 +1532,10 @@ void BuildRunner::WorkerRun(
         }
     });
 
-    auto check_needs_rebuild_using_dep_log = [&](
+    auto check_needs_rebuild_using_dep_log_u64 = [&](
         const std::string& obj_path_str,
         const std::string& src_path_str,
-        const std::string& cmd_hash_str,
+        uint64_t cur_hash_u64,
         const std::string& legacy_key,
         const std::unordered_map<std::string, int64_t>& stat_map,
         const std::filesystem::path& depfile_p,
@@ -1535,7 +1553,6 @@ void BuildRunner::WorkerRun(
             if (src_it == stat_map.end() || src_it->second > disk_obj_mtime) return true;
         }
 
-        uint64_t cur_hash_u64 = DepLog::ParseHashU64(cmd_hash_str);
         DepOutputEntry rec;
         if (dep_log.TryGetOutput(obj_path_str, rec)) {
             if (rec.cmdHash != cur_hash_u64) return true;
@@ -1571,6 +1588,30 @@ void BuildRunner::WorkerRun(
             }
         }
         return true;
+    };
+
+    auto check_needs_rebuild_using_dep_log = [&](
+        const std::string& obj_path_str,
+        const std::string& src_path_str,
+        const std::string& cmd_hash_str,
+        const std::string& legacy_key,
+        const std::unordered_map<std::string, int64_t>& stat_map,
+        const std::filesystem::path& depfile_p,
+        bool is_msvc_json_dep,
+        bool uses_rc_hash,
+        std::vector<std::string>* out_cached_deps
+    ) -> bool {
+        return check_needs_rebuild_using_dep_log_u64(
+            obj_path_str,
+            src_path_str,
+            DepLog::ParseHashU64(cmd_hash_str),
+            legacy_key,
+            stat_map,
+            depfile_p,
+            is_msvc_json_dep,
+            uses_rc_hash,
+            out_cached_deps
+        );
     };
 
     std::vector<std::thread> workers;
@@ -1780,17 +1821,23 @@ void BuildRunner::WorkerRun(
 
                         // Collect all paths to batch-stat via V2-11 directory-batched stat
                         std::vector<std::string> paths_to_stat;
+                        std::unordered_set<std::string> seen_stat_paths;
+                        auto push_stat_path = [&](const std::string& p_str) {
+                            if (!p_str.empty() && seen_stat_paths.insert(p_str).second) {
+                                paths_to_stat.push_back(p_str);
+                            }
+                        };
                         auto collect_dep_paths = [&](const std::string& out_p_str, const std::string& src_p_str) {
-                            paths_to_stat.push_back(out_p_str);
-                            if (!src_p_str.empty()) paths_to_stat.push_back(src_p_str);
+                            push_stat_path(out_p_str);
+                            push_stat_path(src_p_str);
                             DepOutputEntry rec;
                             if (dep_log.TryGetOutput(out_p_str, rec)) {
                                 for (uint32_t did : rec.depIds) {
-                                    std::string dp = dep_log.GetPath(did);
-                                    if (!dp.empty()) paths_to_stat.push_back(dp);
+                                    push_stat_path(dep_log.GetPath(did));
                                 }
                             }
                         };
+                        std::unordered_set<std::string> created_obj_dirs;
 
                         if (plan.pch_analysis.cxxPch.enabled) {
                             collect_dep_paths(plan.pch_analysis.cxxPch.pchOutputFile.generic_u8string(),
@@ -1807,15 +1854,142 @@ void BuildRunner::WorkerRun(
                             }
                         }
 
+                        // Cached group command template: eliminates N * FormulateCompileCommand on 50k builds
+                        struct CompileGroupTemplate {
+                            BuildCommand baseCmd;
+                            size_t prefixCount = 0;
+                            uint64_t hashAfterProgram = 14695981039346656037ULL;
+                        };
+                        std::unordered_map<std::string, CompileGroupTemplate> group_templates;
+
+                        auto fnv_feed_str = [](uint64_t& h, const std::string& s) {
+                            for (unsigned char c : s) {
+                                h ^= c;
+                                h *= 1099511628211ULL;
+                            }
+                            h ^= 0xFF;
+                            h *= 1099511628211ULL;
+                        };
+                        auto format_hash64 = [](uint64_t h) -> std::string {
+                            char buf[32];
+                            std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+                            return std::string(buf);
+                        };
+                        auto get_template = [&](bool is_c_src, bool uses_pch_flag, const EffectiveFileSettings* eff_ptr) -> const CompileGroupTemplate* {
+                            std::ostringstream kss;
+                            kss << (is_c_src ? 'C' : 'X') << (uses_pch_flag ? '1' : '0') << '_' << reinterpret_cast<uintptr_t>(eff_ptr);
+                            std::string key = kss.str();
+                            auto it = group_templates.find(key);
+                            if (it != group_templates.end()) return &it->second;
+
+                            const CompilerInfo* comp_info = is_c_src ? c_comp : cxx_comp;
+                            if (!comp_info) comp_info = cxx_comp;
+
+                            const std::string slot_src = is_c_src ? "__GB_SRC_SLOT__.c" : "__GB_SRC_SLOT__.cpp";
+                            const std::filesystem::path slot_obj("__GB_OBJ_SLOT__.o");
+                            BuildCommand tmpl_cmd = eff_ptr
+                                ? CompilerManager::FormulateCompileCommand(*comp_info, slot_src, slot_obj, project, *eff_ptr)
+                                : CompilerManager::FormulateCompileCommand(*comp_info, slot_src, slot_obj, project, plan.eff);
+                            const PchArtifactPlan& active_pch = is_c_src ? plan.pch_analysis.cPch : plan.pch_analysis.cxxPch;
+                            if (uses_pch_flag && active_pch.enabled) {
+                                PchManager::ApplyPchToCompileCommand(tmpl_cmd, active_pch, is_msvc, is_clang, ccache_with_pch);
+                            }
+
+                            CompileGroupTemplate tpl;
+                            tpl.prefixCount = is_msvc ? 5 : 7;
+                            if (tpl.prefixCount > tmpl_cmd.arguments.size()) {
+                                tpl.prefixCount = tmpl_cmd.arguments.size();
+                            }
+                            fnv_feed_str(tpl.hashAfterProgram, tmpl_cmd.program);
+                            tpl.baseCmd = std::move(tmpl_cmd);
+                            auto inserted = group_templates.emplace(std::move(key), std::move(tpl));
+                            return &inserted.first->second;
+                        };
+                        auto compute_template_hash_u64 = [&](
+                            const CompileGroupTemplate* tpl,
+                            const std::string& src_rel_str,
+                            const std::string& obj_str
+                        ) -> uint64_t {
+                            std::string src_s = src_rel_str;
+                            std::replace(src_s.begin(), src_s.end(), '\\', '/');
+                            std::string obj_s = obj_str;
+                            std::replace(obj_s.begin(), obj_s.end(), '\\', '/');
+
+                            uint64_t h = tpl->hashAfterProgram;
+                            if (is_msvc) {
+                                fnv_feed_str(h, "/c");
+                                fnv_feed_str(h, src_s);
+                                fnv_feed_str(h, "/Fo" + obj_s);
+                                fnv_feed_str(h, "/sourceDependencies");
+                                fnv_feed_str(h, obj_s + ".json");
+                            } else {
+                                fnv_feed_str(h, "-c");
+                                fnv_feed_str(h, src_s);
+                                fnv_feed_str(h, "-o");
+                                fnv_feed_str(h, obj_s);
+                                fnv_feed_str(h, "-MMD");
+                                fnv_feed_str(h, "-MF");
+                                fnv_feed_str(h, obj_s + ".d");
+                            }
+                            for (size_t ai = tpl->prefixCount; ai < tpl->baseCmd.arguments.size(); ++ai) {
+                                fnv_feed_str(h, tpl->baseCmd.arguments[ai]);
+                            }
+                            if (!tpl->baseCmd.hash_salt.empty()) {
+                                fnv_feed_str(h, tpl->baseCmd.hash_salt);
+                            }
+                            return h;
+                        };
+                        auto materialize_template_cmd = [&](
+                            const CompileGroupTemplate* tpl,
+                            const std::string& src_rel_str,
+                            const std::string& obj_str
+                        ) -> BuildCommand {
+                            std::string src_s = src_rel_str;
+                            std::replace(src_s.begin(), src_s.end(), '\\', '/');
+                            std::string obj_s = obj_str;
+                            std::replace(obj_s.begin(), obj_s.end(), '\\', '/');
+
+                            BuildCommand cmd;
+                            cmd.program = tpl->baseCmd.program;
+                            cmd.hash_salt = tpl->baseCmd.hash_salt;
+                            cmd.arguments = tpl->baseCmd.arguments;
+                            if (is_msvc && cmd.arguments.size() >= 5) {
+                                cmd.arguments[1] = src_s;
+                                cmd.arguments[2] = "/Fo" + obj_s;
+                                cmd.arguments[4] = obj_s + ".json";
+                            } else if (!is_msvc && cmd.arguments.size() >= 7) {
+                                cmd.arguments[1] = src_s;
+                                cmd.arguments[3] = obj_s;
+                                cmd.arguments[6] = obj_s + ".d";
+                            }
+                            std::ostringstream ss;
+                            ss << cmd.program;
+                            for (const auto& a : cmd.arguments) {
+                                ss << ' ';
+                                if (a.empty() || a.find_first_of(" \t") != std::string::npos) {
+                                    ss << '"' << a << '"';
+                                } else {
+                                    ss << a;
+                                }
+                            }
+                            cmd.display_command = ss.str();
+                            return cmd;
+                        };
+
                         // Prepare compile descriptors for unity batches + standalone files
                         struct PendingCompileSpec {
                             std::string src_rel;
                             std::string progress_label;
                             std::filesystem::path src_full;
+                            std::string src_full_norm;
                             std::filesystem::path obj_file;
+                            std::string obj_file_str;
+                            std::string obj_norm;
                             std::string obj_key;
                             BuildCommand cmd;
                             std::string cmd_hash;
+                            uint64_t cmd_hash_u64 = 0;
+                            const CompileGroupTemplate* cmd_template = nullptr;
                             bool is_unity = false;
                             bool is_c = false;
                             bool uses_pch = false;
@@ -1828,13 +2002,19 @@ void BuildRunner::WorkerRun(
                             uint32_t est_ms = 10;
                         };
                         std::vector<PendingCompileSpec> candidates;
-                        double target_factor = Scheduler::ComputeTargetMsPerByte(*t, project, dep_log, plan.obj_dir, is_msvc);
+                        candidates.reserve(plan.unity_plan.batches.size() + plan.unity_plan.standaloneFiles.size());
+                        std::vector<std::string> candidate_norm_objs;
+                        candidate_norm_objs.reserve(plan.unity_plan.batches.size() + plan.unity_plan.standaloneFiles.size());
+                        const std::filesystem::path& root_path_ref = project.GetRootPath();
 
                         // 1) Unity batches
                         for (const auto& ub : plan.unity_plan.batches) {
                             std::string obj_key;
                             std::filesystem::path obj_file = ComputeObjectPath(project, plan.obj_dir, ub.generatedFileRel, is_msvc, obj_key);
-                            fs_util::CreateDirsLong(obj_file.parent_path(), ec);
+                            std::string pdir_key = obj_file.parent_path().generic_u8string();
+                            if (created_obj_dirs.insert(pdir_key).second) {
+                                fs_util::CreateDirsLong(obj_file.parent_path(), ec);
+                            }
                             plan.object_paths.push_back(obj_file);
 
                             const CompilerInfo* comp_info = ub.isC ? c_comp : cxx_comp;
@@ -1852,16 +2032,20 @@ void BuildRunner::WorkerRun(
                             PendingCompileSpec pcs;
                             pcs.src_rel = ub.generatedFileRel;
                             pcs.src_full = ub.generatedFileAbs;
+                            pcs.src_full_norm = DepLog::NormalizeDepPath(ub.generatedFileAbs.generic_u8string());
                             pcs.obj_file = obj_file;
+                            pcs.obj_file_str = obj_file.generic_u8string();
+                            pcs.obj_norm = DepLog::NormalizeDepPath(pcs.obj_file_str);
                             pcs.obj_key = obj_key;
                             pcs.cmd_hash = CompilerManager::ComputeCommandHash(cmd);
+                            pcs.cmd_hash_u64 = DepLog::ParseHashU64(pcs.cmd_hash);
                             pcs.cmd = std::move(cmd);
                             pcs.is_unity = true;
                             pcs.is_c = ub.isC;
                             pcs.uses_pch = ub.usesPch;
                             pcs.ccache_eligible = compiler_cache.active;
                             pcs.uses_depfile = true;
-                            pcs.depfile_path = std::filesystem::path(obj_file.generic_u8string() + (is_msvc ? ".json" : ".d"));
+                            pcs.depfile_path = std::filesystem::path(pcs.obj_file_str + (is_msvc ? ".json" : ".d"));
                             if (ub.usesPch && active_pch.enabled) pcs.pch_out_path = active_pch.pchOutputFile;
                             pcs.unity_members = ub.memberFiles;
 
@@ -1873,19 +2057,25 @@ void BuildRunner::WorkerRun(
                             }
                             if (ub.memberFiles.size() > show_n) lbl << " ...";
                             pcs.progress_label = lbl.str();
-                            pcs.est_ms = Scheduler::EstimateCompileDurationMs(obj_file, ub.generatedFileAbs, dep_log, target_factor);
 
-                            collect_dep_paths(obj_file.generic_u8string(), ub.generatedFileAbs.generic_u8string());
+                            push_stat_path(pcs.obj_norm);
+                            push_stat_path(pcs.src_full_norm);
                             for (const auto& mf : ub.memberFiles) {
-                                paths_to_stat.push_back(project.ResolvePath(mf).generic_u8string());
+                                push_stat_path((root_path_ref / std::filesystem::u8path(mf)).generic_u8string());
                             }
+                            candidate_norm_objs.push_back(pcs.obj_norm);
                             candidates.push_back(std::move(pcs));
                         }
 
                         // 2) Standalone files (C/C++ and V2-7 extra source types)
+                        const bool has_custom_tools = !project.GetCustomTools().empty();
+                        const PchArtifactPlan& cxx_pch_ref = plan.pch_analysis.cxxPch;
+                        const PchArtifactPlan& c_pch_ref = plan.pch_analysis.cPch;
                         for (const auto& file_rel : plan.unity_plan.standaloneFiles) {
                             SourceFileKind fk = ToolRegistry::ClassifySourceFile(file_rel, project.GetCustomTools());
-                            std::filesystem::path src_full = project.ResolvePath(file_rel);
+                            std::filesystem::path src_full = (!file_rel.empty() && file_rel.find(':') == std::string::npos && file_rel[0] != '/')
+                                ? (root_path_ref / std::filesystem::u8path(file_rel))
+                                : project.ResolvePath(file_rel);
 
                             if (fk != SourceFileKind::C && fk != SourceFileKind::Cxx) {
                                 ToolCompileSpec tspec = ToolRegistry::FormulateExtraSourceCommand(
@@ -1918,64 +2108,82 @@ void BuildRunner::WorkerRun(
                                 PendingCompileSpec pcs;
                                 pcs.src_rel = file_rel;
                                 pcs.src_full = src_full;
+                                pcs.src_full_norm = DepLog::NormalizeDepPath(src_full.generic_u8string());
                                 pcs.obj_file = tspec.outputPath;
-                                pcs.obj_key = tspec.outputPath.generic_u8string();
+                                pcs.obj_file_str = tspec.outputPath.generic_u8string();
+                                pcs.obj_norm = DepLog::NormalizeDepPath(pcs.obj_file_str);
+                                pcs.obj_key = pcs.obj_file_str;
                                 pcs.cmd = std::move(tspec.command);
+                                pcs.cmd_hash_u64 = DepLog::ParseHashU64(cmd_h);
                                 pcs.cmd_hash = std::move(cmd_h);
                                 pcs.uses_depfile = tspec.usesDepfile;
                                 pcs.uses_rc_hash = tspec.usesRcHash;
                                 pcs.depfile_path = tspec.depfilePath;
                                 pcs.ccache_eligible = false; // never wrap .rc/.asm/.cu/.ispc/custom tools
-                                pcs.est_ms = Scheduler::EstimateCompileDurationMs(tspec.outputPath, src_full, dep_log, target_factor);
-                                collect_dep_paths(tspec.outputPath.generic_u8string(), src_full.generic_u8string());
+                                push_stat_path(pcs.obj_norm);
+                                push_stat_path(pcs.src_full_norm);
+                                candidate_norm_objs.push_back(pcs.obj_norm);
                                 candidates.push_back(std::move(pcs));
                                 continue;
                             }
+                            (void)has_custom_tools;
 
                             bool is_c = (fk == SourceFileKind::C);
-                            const CompilerInfo* comp_info = is_c ? c_comp : cxx_comp;
-                            if (!comp_info) comp_info = cxx_comp;
-
                             std::string obj_key;
                             std::filesystem::path obj_file = ComputeObjectPath(project, plan.obj_dir, file_rel, is_msvc, obj_key);
-                            fs_util::CreateDirsLong(obj_file.parent_path(), ec);
+                            std::string obj_file_str = obj_file.generic_u8string();
+                            std::string pdir_key = obj_file.parent_path().generic_u8string();
+                            if (created_obj_dirs.insert(pdir_key).second) {
+                                fs_util::CreateDirsLong(obj_file.parent_path(), ec);
+                            }
                             plan.object_paths.push_back(obj_file);
 
-                            auto eff_it = grouped_settings.find(file_rel);
-                            BuildCommand cmd = (eff_it != grouped_settings.end() && eff_it->second)
-                                ? CompilerManager::FormulateCompileCommand(*comp_info, file_rel, obj_file, project, *eff_it->second)
-                                : CompilerManager::FormulateCompileCommand(*comp_info, file_rel, obj_file, project, plan.eff);
+                            const EffectiveFileSettings* eff_ptr = nullptr;
+                            if (!grouped_settings.empty()) {
+                                auto eff_it = grouped_settings.find(file_rel);
+                                if (eff_it != grouped_settings.end()) eff_ptr = eff_it->second.get();
+                            }
 
                             bool uses_pch = false;
-                            auto upit = file_uses_pch.find(file_rel);
-                            if (upit != file_uses_pch.end()) uses_pch = upit->second;
-                            const PchArtifactPlan& active_pch = is_c ? plan.pch_analysis.cPch : plan.pch_analysis.cxxPch;
-                            if (uses_pch && active_pch.enabled) {
-                                PchManager::ApplyPchToCompileCommand(cmd, active_pch, is_msvc, is_clang, ccache_with_pch);
+                            if (!file_uses_pch.empty()) {
+                                auto upit = file_uses_pch.find(file_rel);
+                                if (upit != file_uses_pch.end()) uses_pch = upit->second;
                             }
+                            const PchArtifactPlan& active_pch = is_c ? c_pch_ref : cxx_pch_ref;
+                            const CompileGroupTemplate* tpl = get_template(is_c, uses_pch, eff_ptr);
 
                             PendingCompileSpec pcs;
                             pcs.src_rel = file_rel;
-                            pcs.src_full = src_full;
-                            pcs.obj_file = obj_file;
-                            pcs.obj_key = obj_key;
-                            pcs.cmd_hash = CompilerManager::ComputeCommandHash(cmd);
-                            pcs.cmd = std::move(cmd);
+                            pcs.src_full = std::move(src_full);
+                            pcs.src_full_norm = DepLog::NormalizeDepPath(pcs.src_full.generic_u8string());
+                            pcs.obj_file = std::move(obj_file);
+                            pcs.obj_file_str = std::move(obj_file_str);
+                            pcs.obj_norm = DepLog::NormalizeDepPath(pcs.obj_file_str);
+                            pcs.obj_key = std::move(obj_key);
+                            pcs.cmd_template = tpl;
+                            pcs.cmd_hash_u64 = compute_template_hash_u64(tpl, file_rel, pcs.obj_file_str);
                             pcs.is_c = is_c;
                             pcs.uses_pch = uses_pch;
                             pcs.ccache_eligible = compiler_cache.active;
                             pcs.uses_depfile = true;
-                            pcs.depfile_path = std::filesystem::path(obj_file.generic_u8string() + (is_msvc ? ".json" : ".d"));
+                            pcs.depfile_path = std::filesystem::u8path(pcs.obj_file_str + (is_msvc ? ".json" : ".d"));
                             if (uses_pch && active_pch.enabled) pcs.pch_out_path = active_pch.pchOutputFile;
-                            pcs.est_ms = Scheduler::EstimateCompileDurationMs(obj_file, src_full, dep_log, target_factor);
-                            collect_dep_paths(obj_file.generic_u8string(), src_full.generic_u8string());
+                            push_stat_path(pcs.obj_norm);
+                            push_stat_path(pcs.src_full_norm);
+                            candidate_norm_objs.push_back(pcs.obj_norm);
                             candidates.push_back(std::move(pcs));
                         }
+
+                        // Collect all unique header dependency paths in one lock instead of N*dep_log calls
+                        dep_log.CollectTrackedStatPaths(candidate_norm_objs, paths_to_stat);
 
                         checked_files_total.fetch_add(compiled_files.size());
 
                         // Batch stat all collected paths in parallel across directories (V2-11)
                         auto stat_map = DepLog::BatchStatFiles(paths_to_stat, num_workers);
+                        std::vector<int64_t> id_mtimes = dep_log.BuildIdMtimeTable(stat_map);
+                        std::vector<DepOutputEntry> cached_outputs;
+                        dep_log.LookupOutputsBatch(candidate_norm_objs, cached_outputs);
 
                         // Spawn PchBuild nodes if needed
                         size_t cxx_pch_node_id = static_cast<size_t>(-1);
@@ -2017,22 +2225,52 @@ void BuildRunner::WorkerRun(
                         int cxx_pch_local_idx = maybe_plan_pch(plan.pch_analysis.cxxPch, cxx_pch_rebuilt);
                         int c_pch_local_idx = maybe_plan_pch(plan.pch_analysis.cPch, c_pch_rebuilt);
 
+                        bool target_factor_computed = false;
+                        double target_factor = 0.05;
                         std::vector<std::unique_ptr<DagNode>> new_compiles;
                         std::vector<int> compile_pch_dep_idx;
-                        for (auto& pcs : candidates) {
+                        for (size_t ci = 0; ci < candidates.size(); ++ci) {
+                            auto& pcs = candidates[ci];
                             bool force_pch_rebuild = pcs.uses_pch && (pcs.is_c ? c_pch_rebuilt : cxx_pch_rebuilt);
-                            bool needs_compile = force_pch_rebuild || check_needs_rebuild_using_dep_log(
-                                pcs.obj_file.generic_u8string(),
-                                pcs.src_full.generic_u8string(),
-                                pcs.cmd_hash,
-                                pcs.obj_key,
-                                stat_map,
-                                pcs.depfile_path,
-                                is_msvc,
-                                pcs.uses_rc_hash,
-                                nullptr
-                            );
+                            bool needs_compile = force_pch_rebuild;
+                            if (!needs_compile) {
+                                const DepOutputEntry& rec = cached_outputs[ci];
+                                if (rec.outputId != 0) {
+                                    auto obj_it = stat_map.find(pcs.obj_norm);
+                                    auto src_it = stat_map.find(pcs.src_full_norm);
+                                    if (obj_it == stat_map.end() || src_it == stat_map.end() ||
+                                        src_it->second > obj_it->second ||
+                                        rec.cmdHash != pcs.cmd_hash_u64 ||
+                                        rec.mtimeNs != obj_it->second) {
+                                        needs_compile = true;
+                                    } else {
+                                        for (uint32_t did : rec.depIds) {
+                                            int64_t dns = (did < id_mtimes.size()) ? id_mtimes[did] : 0;
+                                            if (dns == 0 || dns > rec.mtimeNs) {
+                                                needs_compile = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    needs_compile = check_needs_rebuild_using_dep_log_u64(
+                                        pcs.obj_file_str,
+                                        pcs.src_full.generic_u8string(),
+                                        pcs.cmd_hash_u64,
+                                        pcs.obj_key,
+                                        stat_map,
+                                        pcs.depfile_path,
+                                        is_msvc,
+                                        pcs.uses_rc_hash,
+                                        nullptr
+                                    );
+                                }
+                            }
                             if (needs_compile) {
+                                if (!target_factor_computed) {
+                                    target_factor = Scheduler::ComputeTargetMsPerByte(*t, project, dep_log, plan.obj_dir, is_msvc);
+                                    target_factor_computed = true;
+                                }
                                 plan.compiled_task_count++;
                                 auto cn = std::make_unique<DagNode>();
                                 cn->kind = DagKind::Compile;
@@ -2042,8 +2280,13 @@ void BuildRunner::WorkerRun(
                                 cn->progress_label = std::move(pcs.progress_label);
                                 cn->obj_path = std::move(pcs.obj_file);
                                 cn->obj_key = std::move(pcs.obj_key);
-                                cn->cmd = std::move(pcs.cmd);
-                                cn->cmd_hash = std::move(pcs.cmd_hash);
+                                if (pcs.cmd_template) {
+                                    cn->cmd = materialize_template_cmd(pcs.cmd_template, cn->src_rel, pcs.obj_file_str);
+                                    cn->cmd_hash = format_hash64(pcs.cmd_hash_u64);
+                                } else {
+                                    cn->cmd = std::move(pcs.cmd);
+                                    cn->cmd_hash = std::move(pcs.cmd_hash);
+                                }
                                 if (pcs.ccache_eligible) {
                                     CompilerCacheManager::PrependLauncher(cn->cmd, compiler_cache);
                                 }
@@ -2056,7 +2299,7 @@ void BuildRunner::WorkerRun(
                                 cn->depfile_path = std::move(pcs.depfile_path);
                                 cn->pch_dep_output = std::move(pcs.pch_out_path);
                                 cn->unity_members = std::move(pcs.unity_members);
-                                cn->priority_ms = pcs.est_ms;
+                                cn->priority_ms = Scheduler::EstimateCompileDurationMs(cn->obj_path, pcs.src_full, dep_log, target_factor);
 
                                 int dep_local = -1;
                                 if (pcs.uses_pch) {
@@ -2068,6 +2311,20 @@ void BuildRunner::WorkerRun(
                             } else {
                                 up_to_date_count.fetch_add(1);
                                 m_prog_uptodate.fetch_add(1);
+                            }
+                        }
+
+                        if (plan.compiled_task_count == 0 && !plan.object_paths.empty()) {
+                            for (const auto& obj_p : plan.object_paths) {
+                                auto sit = stat_map.find(DepLog::NormalizeDepPath(obj_p.generic_u8string()));
+                                int64_t ons = (sit != stat_map.end()) ? sit->second : DepLog::StatFileNs(obj_p);
+                                if (ons == 0) {
+                                    plan.any_obj_missing = true;
+                                    break;
+                                }
+                                if (ons > plan.max_obj_mtime_ns) {
+                                    plan.max_obj_mtime_ns = ons;
+                                }
                             }
                         }
 
@@ -2357,16 +2614,12 @@ void BuildRunner::WorkerRun(
                             needs_link = true;
                         } else {
                             auto bin_time = std::filesystem::last_write_time(fs_util::ToWinLongPath(binary_path), bin_ec);
-                            if (bin_ec) {
+                            int64_t bin_ns = DepLog::StatFileNs(binary_path);
+                            if (bin_ec || bin_ns == 0) {
                                 needs_link = true;
                             } else {
-                                for (const auto& obj_p : plan.object_paths) {
-                                    std::error_code obj_ec;
-                                    auto obj_t = std::filesystem::last_write_time(fs_util::ToWinLongPath(obj_p), obj_ec);
-                                    if (obj_ec || obj_t > bin_time) {
-                                        needs_link = true;
-                                        break;
-                                    }
+                                if (plan.any_obj_missing || plan.max_obj_mtime_ns == 0 || plan.max_obj_mtime_ns > bin_ns) {
+                                    needs_link = true;
                                 }
                                 if (!needs_link) {
                                     std::lock_guard<std::mutex> llock(link_track_mutex);
@@ -2539,6 +2792,10 @@ void BuildRunner::WorkerRun(
             : project.ResolvePath(cc_cfg.path);
         std::string cc_cfg_key = cc_cfg.path + "|" + (cc_cfg.allConfigs ? "1" : "0");
         uint64_t cur_rev = project.Revision();
+        std::filesystem::path cc_sig_path = project.GetRootPath() / ".geniebuild" / "compdb.sig";
+        int64_t proj_json_ns = DepLog::StatFileNs(project.GetRootPath() / ".geniebuild" / "project.json");
+        std::string disk_compdb_sig = std::to_string(proj_json_ns) + "|" + std::to_string(checked_files_total.load()) +
+                                      "|" + config + "|" + tc_hash8 + "|" + cc_cfg_key;
         bool can_skip_compdb = false;
         {
             std::lock_guard<std::mutex> rlk(m_result_mutex);
@@ -2550,6 +2807,12 @@ void BuildRunner::WorkerRun(
                               (cc_cfg_key == m_last_compdb_cfg_key) &&
                               fs_util::ExistsLong(cc_out_path);
         }
+        if (!can_skip_compdb && total_steps_run.load() == 0 && total_tasks == 0 && fs_util::ExistsLong(cc_out_path)) {
+            std::string prev_sig;
+            if (fs_util::ReadFileTextLong(cc_sig_path, prev_sig) && prev_sig == disk_compdb_sig) {
+                can_skip_compdb = true;
+            }
+        }
         if (can_skip_compdb) {
             compdb_res.success = true;
             compdb_res.fileModified = false;
@@ -2557,6 +2820,8 @@ void BuildRunner::WorkerRun(
         } else {
             compdb_res = CompDbManager::ExportCompileCommands(project, compiler_manager, active_tc);
             if (compdb_res.success) {
+                bool written_sig = false;
+                fs_util::AtomicWriteTextIfChanged(cc_sig_path, disk_compdb_sig, &written_sig);
                 std::lock_guard<std::mutex> rlk(m_result_mutex);
                 m_last_compdb_revision = cur_rev;
                 m_last_compdb_root = project.GetRootPath();

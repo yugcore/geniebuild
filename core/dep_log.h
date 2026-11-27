@@ -107,6 +107,21 @@ public:
         int num_threads = 0
     );
 
+    // Single-lock batch helpers for high-scale (50k+ TU) incremental planning
+    void CollectTrackedStatPaths(
+        const std::vector<std::string>& norm_output_paths,
+        std::vector<std::string>& out_paths
+    ) const;
+
+    std::vector<int64_t> BuildIdMtimeTable(
+        const std::unordered_map<std::string, int64_t>& stat_map
+    ) const;
+
+    void LookupOutputsBatch(
+        const std::vector<std::string>& norm_output_paths,
+        std::vector<DepOutputEntry>& out_entries
+    ) const;
+
     // Analyzes recorded dependencies for given TU outputs to suggest PCH headers (V2-8)
     std::vector<PchHeaderCandidate> SuggestPchHeaders(
         const std::vector<std::string>& target_output_paths,

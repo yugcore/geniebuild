@@ -15,6 +15,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -140,14 +141,18 @@ bool LooksGeneratedSourceFile(const std::filesystem::path& file_p, const std::fi
         fname.find(".pb.cc") != std::string::npos || fname.find(".pb.cpp") != std::string::npos) {
         return true;
     }
+    std::string full_low = ToLowerCd(file_p.generic_u8string());
+    if (full_low.find("/cmakefiles/") != std::string::npos || full_low.find("/.geniebuild/gen/") != std::string::npos) {
+        return true;
+    }
+    // FetchContent sources live under build/_deps/<pkg>-src/; keep them as real source trees
+    if (full_low.find("/_deps/") != std::string::npos && full_low.find("-src/") != std::string::npos) {
+        return false;
+    }
     if (!compdb_dir.empty() && compdb_dir.lexically_normal() != root_p.lexically_normal()) {
         if (IsPathInsideDir(file_p, compdb_dir)) {
             return true;
         }
-    }
-    std::string full_low = ToLowerCd(file_p.generic_u8string());
-    if (full_low.find("/cmakefiles/") != std::string::npos || full_low.find("/.geniebuild/gen/") != std::string::npos) {
-        return true;
     }
     return false;
 }
@@ -277,6 +282,521 @@ bool SourceFileLooksLikeEntryPoint(const std::filesystem::path& file_abs) {
            text.find("wmain(") != std::string::npos ||
            text.find("WinMain(") != std::string::npos ||
            text.find("wWinMain(") != std::string::npos;
+}
+
+std::string TrimCd(std::string s) {
+    size_t a = 0;
+    while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+    size_t b = s.size();
+    while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+    return s.substr(a, b - a);
+}
+
+std::string ReplaceAllCd(std::string s, const std::string& from, const std::string& to) {
+    if (from.empty()) return s;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return s;
+}
+
+std::string UnwrapShellCommandCd(std::string cmd) {
+    cmd = TrimCd(cmd);
+    while (!cmd.empty() && cmd.front() == '@') {
+        cmd.erase(0, 1);
+        cmd = TrimCd(cmd);
+    }
+    std::string low = ToLowerCd(cmd);
+    size_t c_pos = std::string::npos;
+    if (low.rfind("cmd.exe /c ", 0) == 0 || low.rfind("cmd /c ", 0) == 0) {
+        c_pos = low.find("/c ") + 3;
+    } else {
+        size_t exe_pos = low.find("cmd.exe");
+        if (exe_pos != std::string::npos) {
+            size_t after = exe_pos + 7;
+            if (after < low.size() && low[after] == '"') ++after;
+            while (after < low.size() && std::isspace(static_cast<unsigned char>(low[after]))) ++after;
+            if (after + 3 <= low.size() && low.substr(after, 3) == "/c ") {
+                bool valid_prefix = (exe_pos == 0) || cmd[exe_pos - 1] == '/' || cmd[exe_pos - 1] == '\\' || cmd[exe_pos - 1] == '"';
+                if (valid_prefix) c_pos = after + 3;
+            }
+        }
+    }
+    if (c_pos != std::string::npos && c_pos <= cmd.size()) {
+        std::string inner = TrimCd(cmd.substr(c_pos));
+        if (inner.size() >= 2 && inner.front() == '"' && inner.back() == '"') {
+            inner = inner.substr(1, inner.size() - 2);
+        }
+        return TrimCd(inner);
+    }
+    return cmd;
+}
+
+std::string EnsureBuildCwdCommandCd(
+    const std::string& cmd,
+    const std::filesystem::path& compdb_dir,
+    const std::filesystem::path& project_root
+) {
+    std::string trimmed = TrimCd(cmd);
+    if (trimmed.empty()) return trimmed;
+    if (compdb_dir.empty() || compdb_dir.lexically_normal() == project_root.lexically_normal()) {
+        return trimmed;
+    }
+    std::string low = ToLowerCd(trimmed);
+    if (low.rfind("cd ", 0) == 0 || low.rfind("cd\t", 0) == 0) {
+        return trimmed;
+    }
+    std::string bdir_rel = MakeRelFwd(compdb_dir, project_root);
+    if (bdir_rel.empty() || bdir_rel == ".") return trimmed;
+    std::string quoted_dir = (bdir_rel.find_first_of(" \t") != std::string::npos) ? ("\"" + bdir_rel + "\"") : bdir_rel;
+#if defined(_WIN32)
+    return "cd /D " + quoted_dir + " && " + trimmed;
+#else
+    return "cd " + quoted_dir + " && " + trimmed;
+#endif
+}
+
+bool IsIgnoredCodegenOutputCd(const std::string& low_path) {
+    if (low_path.empty()) return true;
+    std::string norm = low_path;
+    std::replace(norm.begin(), norm.end(), '\\', '/');
+    if (norm.find("cmakefiles/") != std::string::npos || norm.find(".geniebuild/") != std::string::npos) {
+        return true;
+    }
+    std::filesystem::path p = std::filesystem::u8path(norm);
+    std::string fname = p.filename().generic_u8string();
+    std::string ext = p.extension().generic_u8string();
+    if (fname == ".phony" || fname == "cmake_force" || fname == "cmake_check_build_system" ||
+        fname == "cmakecache.txt" || fname == "build.ninja" || fname == "all" ||
+        fname == "clean" || fname == "install" || fname == "test" || fname == "package" ||
+        fname == "edit_cache" || fname == "rebuild_cache" || fname == "codegen") {
+        return true;
+    }
+    if (EndsWithCiCd(norm, ".stamp") || EndsWithCiCd(norm, ".cmake")) return true;
+    if (ext == ".obj" || ext == ".o" || ext == ".i" || ext == ".s" || ext == ".d" ||
+        ext == ".a" || ext == ".lib" || ext == ".so" || ext == ".dylib" || ext == ".dll" ||
+        ext == ".exe" || ext == ".pdb" || ext == ".rsp" || ext == ".manifest" ||
+        ext == ".ilk" || ext == ".exp") {
+        return true;
+    }
+    return false;
+}
+
+bool IsHousekeepingCodegenInputCd(const std::string& low_path) {
+    if (low_path.empty()) return true;
+    std::string norm = low_path;
+    std::replace(norm.begin(), norm.end(), '\\', '/');
+    if (norm.find("cmakefiles/") != std::string::npos) return true;
+    std::filesystem::path p = std::filesystem::u8path(norm);
+    std::string fname = p.filename().generic_u8string();
+    if (fname == "cmake_force" || fname == "cmake_check_build_system" || fname == "build.ninja") return true;
+    if (EndsWithCiCd(norm, ".stamp") || EndsWithCiCd(norm, ".make") || EndsWithCiCd(norm, ".cmake")) return true;
+    return false;
+}
+
+std::string ExpandNinjaVarsAndUnescape(
+    const std::string& raw,
+    const std::unordered_map<std::string, std::string>& vars
+) {
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '$' && i + 1 < raw.size()) {
+            char nxt = raw[i + 1];
+            if (nxt == '$' || nxt == ' ' || nxt == ':' || nxt == '\n') {
+                if (nxt != '\n') out.push_back(nxt);
+                ++i;
+                continue;
+            }
+            if (nxt == '{') {
+                size_t close = raw.find('}', i + 2);
+                if (close != std::string::npos) {
+                    std::string vname = raw.substr(i + 2, close - (i + 2));
+                    auto it = vars.find(vname);
+                    if (it != vars.end()) out += it->second;
+                    i = close;
+                    continue;
+                }
+            }
+        }
+        out.push_back(raw[i]);
+    }
+    return out;
+}
+
+std::vector<std::string> SplitNinjaTokenList(
+    const std::string& raw,
+    const std::unordered_map<std::string, std::string>& vars
+) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        char c = raw[i];
+        if (c == '$' && i + 1 < raw.size()) {
+            cur.push_back(c);
+            cur.push_back(raw[i + 1]);
+            ++i;
+            continue;
+        }
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            if (!cur.empty()) {
+                std::string un = TrimCd(ExpandNinjaVarsAndUnescape(cur, vars));
+                if (!un.empty()) out.push_back(std::move(un));
+                cur.clear();
+            }
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) {
+        std::string un = TrimCd(ExpandNinjaVarsAndUnescape(cur, vars));
+        if (!un.empty()) out.push_back(std::move(un));
+    }
+    return out;
+}
+
+struct ImportedCustomStepCandidate {
+    BuildStep step;
+    std::string preferredTarget;
+};
+
+std::string MakeBuildRelNormalized(
+    const std::string& raw_tok,
+    const std::filesystem::path& compdb_dir,
+    const std::filesystem::path& project_root
+) {
+    std::string t = TrimCd(raw_tok);
+    if (t.size() >= 2 && ((t.front() == '"' && t.back() == '"') || (t.front() == '\'' && t.back() == '\''))) {
+        t = t.substr(1, t.size() - 2);
+    }
+    if (t.empty()) return "";
+    std::filesystem::path p = std::filesystem::u8path(t);
+    if (!p.is_absolute()) {
+        p = compdb_dir / p;
+    }
+    return MakeRelFwd(p.lexically_normal(), project_root);
+}
+
+std::vector<ImportedCustomStepCandidate> ExtractNinjaCustomSteps(
+    const std::filesystem::path& ninja_path,
+    const std::filesystem::path& compdb_dir,
+    const std::filesystem::path& project_root,
+    std::unordered_map<std::string, std::string>& out_target_by_output
+) {
+    std::vector<ImportedCustomStepCandidate> results;
+    std::string raw;
+    if (!fs_util::ReadFileTextLong(ninja_path, raw)) return results;
+
+    // Fold Ninja '$' line continuations into logical lines
+    std::vector<std::string> lines;
+    {
+        std::istringstream iss(raw);
+        std::string line, logical;
+        bool continuing = false;
+        while (std::getline(iss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (continuing) {
+                size_t a = 0;
+                while (a < line.size() && (line[a] == ' ' || line[a] == '\t')) ++a;
+                line.erase(0, a);
+                logical += line;
+            } else {
+                logical = std::move(line);
+            }
+            // Odd trailing '$' count means Ninja line continuation
+            size_t dollar_run = 0;
+            for (size_t k = logical.size(); k > 0 && logical[k - 1] == '$'; --k) ++dollar_run;
+            if (dollar_run % 2 == 1) {
+                logical.pop_back();
+                continuing = true;
+            } else {
+                continuing = false;
+                lines.push_back(std::move(logical));
+            }
+        }
+        if (continuing && !logical.empty()) {
+            lines.push_back(std::move(logical));
+        }
+    }
+
+    std::unordered_map<std::string, std::string> vars;
+    std::unordered_map<std::string, std::vector<std::string>> order_deps_by_phony;
+
+    auto find_ninja_colon = [](const std::string& s) -> size_t {
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '$' && i + 1 < s.size()) { ++i; continue; }
+            if (s[i] == ':') return i;
+        }
+        return std::string::npos;
+    };
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string& ln = lines[i];
+        if (ln.empty() || ln[0] == '#') continue;
+
+        if (ln[0] != ' ' && ln[0] != '\t' && ln.rfind("build ", 0) != 0 && ln.rfind("rule ", 0) != 0) {
+            size_t eq = ln.find('=');
+            if (eq != std::string::npos) {
+                std::string k = TrimCd(ln.substr(0, eq));
+                std::string v = TrimCd(ExpandNinjaVarsAndUnescape(ln.substr(eq + 1), vars));
+                if (!k.empty()) vars[k] = v;
+            }
+            continue;
+        }
+
+        if (ln.rfind("build ", 0) != 0) continue;
+
+        size_t colon = find_ninja_colon(ln);
+        if (colon == std::string::npos) continue;
+
+        std::string outs_part = TrimCd(ln.substr(6, colon - 6));
+        std::string rest_part = TrimCd(ln.substr(colon + 1));
+
+        std::string raw_command, raw_desc, raw_depfile;
+        while (i + 1 < lines.size() && !lines[i + 1].empty() && (lines[i + 1][0] == ' ' || lines[i + 1][0] == '\t')) {
+            ++i;
+            std::string sub = TrimCd(lines[i]);
+            size_t eq = sub.find('=');
+            if (eq == std::string::npos) continue;
+            std::string k = TrimCd(sub.substr(0, eq));
+            std::string v = TrimCd(sub.substr(eq + 1));
+            if (k == "COMMAND") raw_command = ExpandNinjaVarsAndUnescape(v, vars);
+            else if (k == "DESC") raw_desc = ExpandNinjaVarsAndUnescape(v, vars);
+            else if (k == "depfile") raw_depfile = ExpandNinjaVarsAndUnescape(v, vars);
+        }
+
+        // Parse rule name + inputs (stopping at order-only '||')
+        std::vector<std::string> rest_toks = SplitNinjaTokenList(rest_part, vars);
+        if (rest_toks.empty()) continue;
+        const std::string& rule_name = rest_toks[0];
+
+        std::vector<std::string> raw_outs = SplitNinjaTokenList(outs_part, vars);
+
+        // Track cmake_object_order_depends_target_<T> phony edges to infer consuming targets
+        if (rule_name == "phony") {
+            for (const auto& ot : raw_outs) {
+                const std::string prefix = "cmake_object_order_depends_target_";
+                if (ot.rfind(prefix, 0) == 0 && ot.size() > prefix.size()) {
+                    std::string tgt = ot.substr(prefix.size());
+                    for (size_t ri = 1; ri < rest_toks.size(); ++ri) {
+                        if (rest_toks[ri] == "|" || rest_toks[ri] == "||") continue;
+                        std::string out_rel = MakeBuildRelNormalized(rest_toks[ri], compdb_dir, project_root);
+                        std::string low_rel = ToLowerCd(out_rel);
+                        if (!IsIgnoredCodegenOutputCd(low_rel)) {
+                            out_target_by_output.emplace(low_rel, tgt);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (rule_name.rfind("CUSTOM_COMMAND", 0) != 0 && raw_command.empty()) continue;
+        std::string cmd_clean = UnwrapShellCommandCd(raw_command);
+        if (cmd_clean.empty()) continue;
+
+        BuildStep st;
+        st.phase = StepPhase::PreBuild;
+        st.shell = true;
+        st.command = EnsureBuildCwdCommandCd(cmd_clean, compdb_dir, project_root);
+
+        for (const auto& ot : raw_outs) {
+            if (ot == "|") continue;
+            std::string rel = MakeBuildRelNormalized(ot, compdb_dir, project_root);
+            std::string low_rel = ToLowerCd(rel);
+            if (!IsIgnoredCodegenOutputCd(low_rel)) {
+                if (std::find(st.outputs.begin(), st.outputs.end(), rel) == st.outputs.end()) {
+                    st.outputs.push_back(rel);
+                    if (IsStepGeneratedSourcePath(rel)) st.generatesSources = true;
+                }
+            }
+        }
+        if (st.outputs.empty()) continue;
+
+        bool in_order_only = false;
+        for (size_t ri = 1; ri < rest_toks.size(); ++ri) {
+            const std::string& itok = rest_toks[ri];
+            if (itok == "||") { in_order_only = true; continue; }
+            if (itok == "|") continue;
+            if (in_order_only) continue;
+            std::string rel = MakeBuildRelNormalized(itok, compdb_dir, project_root);
+            std::string low_rel = ToLowerCd(rel);
+            if (!IsHousekeepingCodegenInputCd(low_rel)) {
+                if (std::find(st.inputs.begin(), st.inputs.end(), rel) == st.inputs.end()) {
+                    st.inputs.push_back(rel);
+                }
+            }
+        }
+
+        if (!raw_depfile.empty()) {
+            st.depfile = MakeBuildRelNormalized(raw_depfile, compdb_dir, project_root);
+        }
+
+        std::string sname = TrimCd(raw_desc);
+        if (sname.empty()) {
+            sname = "codegen: " + std::filesystem::u8path(st.outputs[0]).filename().generic_u8string();
+        }
+        st.name = sname;
+
+        ImportedCustomStepCandidate cand;
+        cand.step = std::move(st);
+        results.push_back(std::move(cand));
+    }
+
+    return results;
+}
+
+std::vector<ImportedCustomStepCandidate> ExtractMakeCustomSteps(
+    const std::filesystem::path& compdb_dir,
+    const std::filesystem::path& project_root
+) {
+    std::vector<ImportedCustomStepCandidate> results;
+    std::filesystem::path cm_root = compdb_dir / "CMakeFiles";
+    if (!fs_util::ExistsLong(cm_root)) return results;
+
+    std::vector<std::pair<std::filesystem::path, std::string>> make_files;
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(fs_util::ToWinLongPath(cm_root), ec)) {
+        if (ec) break;
+        if (!de.is_directory(ec)) continue;
+        std::string dname = de.path().filename().generic_u8string();
+        if (!EndsWithCiCd(dname, ".dir")) continue;
+        std::filesystem::path bm = de.path() / "build.make";
+        if (fs_util::ExistsLong(bm)) {
+            std::string tname = dname.substr(0, dname.size() - 4);
+            make_files.emplace_back(bm, tname);
+        }
+    }
+    std::sort(make_files.begin(), make_files.end(), [](const auto& a, const auto& b) {
+        return a.first.generic_u8string() < b.first.generic_u8string();
+    });
+
+    auto find_make_colon = [](const std::string& ln) -> size_t {
+        for (size_t i = 0; i < ln.size(); ++i) {
+            if (ln[i] == ':') {
+                // Skip Windows drive letter colons like C:/... or D:\...
+                if (i == 1 && std::isalpha(static_cast<unsigned char>(ln[0]))) continue;
+                if (i + 1 < ln.size() && (ln[i + 1] == '/' || ln[i + 1] == '\\')) continue;
+                return i;
+            }
+        }
+        return std::string::npos;
+    };
+
+    for (const auto& [bm_path, dir_target] : make_files) {
+        std::string raw;
+        if (!fs_util::ReadFileTextLong(bm_path, raw)) continue;
+
+        std::string cmake_cmd = "cmake";
+        struct RuleAccum {
+            std::string outputRaw;
+            std::vector<std::string> depsRaw;
+            std::vector<std::string> recipeLines;
+        };
+        std::vector<std::string> rule_order;
+        std::unordered_map<std::string, RuleAccum> rules_by_out;
+        std::string current_rule_key;
+
+        std::istringstream iss(raw);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) {
+                current_rule_key.clear();
+                continue;
+            }
+            if (line[0] == '#') continue;
+
+            if (line[0] == '\t') {
+                if (!current_rule_key.empty()) {
+                    std::string cmd_ln = TrimCd(line.substr(1));
+                    while (!cmd_ln.empty() && cmd_ln.front() == '@') {
+                        cmd_ln.erase(0, 1);
+                        cmd_ln = TrimCd(cmd_ln);
+                    }
+                    if (!cmd_ln.empty() && cmd_ln.find("cmake_echo_color") == std::string::npos &&
+                        cmd_ln.find("cmake_progress_report") == std::string::npos) {
+                        cmd_ln = ReplaceAllCd(cmd_ln, "$(CMAKE_COMMAND)", cmake_cmd);
+                        cmd_ln = UnwrapShellCommandCd(cmd_ln);
+                        if (!cmd_ln.empty()) {
+                            rules_by_out[current_rule_key].recipeLines.push_back(std::move(cmd_ln));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            current_rule_key.clear();
+            if (line.rfind("CMAKE_COMMAND", 0) == 0) {
+                size_t eq = line.find('=');
+                if (eq != std::string::npos) {
+                    std::string v = TrimCd(line.substr(eq + 1));
+                    if (!v.empty()) cmake_cmd = v;
+                    continue;
+                }
+            }
+            if (line.find('=') != std::string::npos && find_make_colon(line) == std::string::npos) {
+                continue;
+            }
+
+            size_t colon = find_make_colon(line);
+            if (colon == std::string::npos) continue;
+
+            std::string lhs = TrimCd(line.substr(0, colon));
+            std::string rhs = TrimCd(line.substr(colon + 1));
+            if (lhs.empty() || lhs.find("$(") != std::string::npos || lhs.find('%') != std::string::npos) continue;
+            std::string out_rel = MakeBuildRelNormalized(lhs, compdb_dir, project_root);
+            if (IsIgnoredCodegenOutputCd(ToLowerCd(out_rel))) continue;
+
+            std::string key = ToLowerCd(out_rel);
+            if (rules_by_out.find(key) == rules_by_out.end()) {
+                rule_order.push_back(key);
+                rules_by_out[key].outputRaw = out_rel;
+            }
+            current_rule_key = key;
+
+            std::vector<std::string> deps = CompDbManager::SplitCommandLine(rhs);
+            for (const auto& d : deps) {
+                if (d.find("$(") != std::string::npos) continue;
+                std::string dep_rel = MakeBuildRelNormalized(d, compdb_dir, project_root);
+                if (!IsHousekeepingCodegenInputCd(ToLowerCd(dep_rel))) {
+                    auto& acc = rules_by_out[key];
+                    if (std::find(acc.depsRaw.begin(), acc.depsRaw.end(), dep_rel) == acc.depsRaw.end()) {
+                        acc.depsRaw.push_back(dep_rel);
+                    }
+                }
+            }
+        }
+
+        for (const auto& key : rule_order) {
+            const auto& acc = rules_by_out[key];
+            if (acc.recipeLines.empty()) continue;
+
+            std::string joined_cmd;
+            for (size_t ri = 0; ri < acc.recipeLines.size(); ++ri) {
+                if (ri > 0) joined_cmd += " && ";
+                joined_cmd += acc.recipeLines[ri];
+            }
+
+            BuildStep st;
+            st.name = "codegen: " + std::filesystem::u8path(acc.outputRaw).filename().generic_u8string();
+            st.phase = StepPhase::PreBuild;
+            st.shell = true;
+            st.inputs = acc.depsRaw;
+            st.outputs = { acc.outputRaw };
+            st.command = EnsureBuildCwdCommandCd(joined_cmd, compdb_dir, project_root);
+            st.generatesSources = IsStepGeneratedSourcePath(acc.outputRaw);
+
+            ImportedCustomStepCandidate cand;
+            cand.step = std::move(st);
+            cand.preferredTarget = dir_target;
+            results.push_back(std::move(cand));
+        }
+    }
+
+    return results;
 }
 
 } // namespace
@@ -570,6 +1090,14 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
         return "";
     };
 
+    struct ExcludedGenRecord {
+        std::string fileRel;
+        std::string fileName;
+        std::string targetName;
+    };
+    std::vector<ExcludedGenRecord> excluded_gen_records;
+    std::unordered_map<std::string, std::string> gen_tu_target_by_rel;
+
     for (const auto& entry : arr) {
         if (!entry.is_object()) continue;
         plan.totalEntriesParsed++;
@@ -585,11 +1113,17 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
 
         if (LooksGeneratedSourceFile(file_abs, compdb_dir, project_root)) {
             plan.excludedGeneratedCount++;
-            if (plan.warningsList.size() < 40) {
-                plan.warningsList.push_back(
-                    file_abs.filename().generic_u8string() + " generated by original build system; recreate with a build step (V2-6)."
-                );
+            std::string g_out = entry.value("output", "");
+            std::string g_tgt = extract_cmake_target(g_out);
+            std::string g_rel = MakeRelFwd(file_abs, project_root);
+            if (!g_tgt.empty()) {
+                gen_tu_target_by_rel.emplace(ToLowerCd(g_rel), g_tgt);
             }
+            excluded_gen_records.push_back(ExcludedGenRecord{
+                g_rel,
+                file_abs.filename().generic_u8string(),
+                g_tgt
+            });
             continue;
         }
 
@@ -783,6 +1317,51 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
     std::unordered_set<std::string> all_target_names;
     for (const auto& tname : target_order) all_target_names.insert(tname);
 
+    // Pre-pass: map each target's produced archive/import-lib filenames (e.g. libglfw3.a -> glfw)
+    struct CachedLinkInfo {
+        bool valid = false;
+        std::vector<std::string> tokens;
+        std::filesystem::path entryDir;
+        std::filesystem::path cmDir;
+    };
+    std::unordered_map<std::string, CachedLinkInfo> parsed_links;
+    std::unordered_map<std::string, std::string> lib_file_to_target;
+    for (const auto& tname : target_order) {
+        auto cm_it = cmake_dir_by_target.find(tname);
+        if (cm_it == cmake_dir_by_target.end()) continue;
+        std::filesystem::path link_txt = cm_it->second.first / "link.txt";
+        std::string link_raw;
+        if (!fs_util::ReadFileTextLong(link_txt, link_raw)) continue;
+
+        CachedLinkInfo cli;
+        cli.valid = true;
+        cli.entryDir = cm_it->second.second;
+        cli.cmDir = cm_it->second.first;
+        std::vector<std::string> link_raw_toks = SplitCommandLine(link_raw);
+        ExpandResponseFilesRecursive(link_raw_toks, cli.entryDir, project_root, cli.tokens, rsp_cache);
+
+        for (size_t li = 0; li < cli.tokens.size(); ++li) {
+            const std::string& lt = cli.tokens[li];
+            std::string f_low = ToLowerCd(std::filesystem::u8path(lt).filename().generic_u8string());
+            if ((f_low == "ar" || f_low == "ar.exe" || f_low == "gcc-ar" || f_low == "gcc-ar.exe" ||
+                 f_low == "llvm-ar" || f_low == "llvm-ar.exe") && li + 2 < cli.tokens.size()) {
+                // Pattern: ar qc <archive> ...
+                std::string arch_tok = cli.tokens[li + 2];
+                std::string arch_f = ToLowerCd(std::filesystem::u8path(arch_tok).filename().generic_u8string());
+                if (arch_f != "objects.a" && (EndsWithCiCd(arch_f, ".a") || EndsWithCiCd(arch_f, ".lib"))) {
+                    lib_file_to_target[arch_f] = tname;
+                    std::string stem = ToLowerCd(ExtractTargetTokenFromLibPath(arch_tok));
+                    if (!stem.empty()) lib_file_to_target[stem] = tname;
+                }
+            } else if (lt.rfind("-Wl,--out-implib,", 0) == 0) {
+                std::string imp = lt.substr(17);
+                std::string imp_f = ToLowerCd(std::filesystem::u8path(imp).filename().generic_u8string());
+                if (!imp_f.empty()) lib_file_to_target[imp_f] = tname;
+            }
+        }
+        parsed_links[tname] = std::move(cli);
+    }
+
     for (const auto& tname : target_order) {
         const auto& tus = by_target[tname];
         ImportedTargetSuggestion ts;
@@ -794,72 +1373,103 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
 
         // Parse CMake link.txt + linkLibs.rsp when available for exact target kind, deps, and libs
         bool resolved_from_link_txt = false;
-        auto cm_it = cmake_dir_by_target.find(tname);
-        if (cm_it != cmake_dir_by_target.end()) {
-            std::filesystem::path link_txt = cm_it->second.first / "link.txt";
-            std::string link_raw;
-            if (fs_util::ReadFileTextLong(link_txt, link_raw)) {
-                resolved_from_link_txt = true;
-                std::vector<std::string> link_raw_toks = SplitCommandLine(link_raw);
-                std::vector<std::string> link_toks;
-                ExpandResponseFilesRecursive(link_raw_toks, cm_it->second.second, project_root, link_toks, rsp_cache);
+        auto pl_it = parsed_links.find(tname);
+        if (pl_it != parsed_links.end() && pl_it->second.valid) {
+            resolved_from_link_txt = true;
+            const auto& link_toks = pl_it->second.tokens;
+            const std::filesystem::path& link_entry_dir = pl_it->second.entryDir;
 
-                bool saw_ar = false;
-                bool saw_shared = has_shared_hint;
-                bool saw_exe_out = false;
-                bool saw_lib_out = false;
-                std::unordered_set<std::string> seen_deps, seen_libs;
+            bool saw_ar = false;
+            bool saw_shared = has_shared_hint;
+            bool saw_exe_out = false;
+            bool saw_lib_out = false;
+            std::unordered_set<std::string> seen_deps, seen_libs, seen_lflags, seen_rc_files;
 
-                for (size_t li = 0; li < link_toks.size(); ++li) {
-                    const std::string& lt = link_toks[li];
-                    std::string low_lt = ToLowerCd(lt);
-                    std::string fname_low = ToLowerCd(std::filesystem::u8path(lt).filename().generic_u8string());
-                    if (fname_low == "ar" || fname_low == "ar.exe" || fname_low == "gcc-ar" || fname_low == "gcc-ar.exe" ||
-                        fname_low == "llvm-ar" || fname_low == "llvm-ar.exe" || fname_low == "lib.exe") {
-                        saw_ar = true;
-                    }
-                    if (lt == "-shared" || lt == "/DLL" || lt == "/LD" || lt == "/LDd") {
-                        saw_shared = true;
-                    }
-                    if ((lt == "-o" || lt == "/OUT:") && li + 1 < link_toks.size()) {
-                        std::string out_arg = link_toks[li + 1];
-                        if (EndsWithCiCd(out_arg, ".exe")) saw_exe_out = true;
-                        else if (EndsWithCiCd(out_arg, ".dll") || EndsWithCiCd(out_arg, ".so") || EndsWithCiCd(out_arg, ".dylib")) saw_shared = true;
-                        else if (EndsWithCiCd(out_arg, ".a") || EndsWithCiCd(out_arg, ".lib")) saw_lib_out = true;
-                    }
-                    if (lt.rfind("/OUT:", 0) == 0) {
-                        if (EndsWithCiCd(lt, ".exe")) saw_exe_out = true;
-                        else if (EndsWithCiCd(lt, ".dll")) saw_shared = true;
-                        else if (EndsWithCiCd(lt, ".lib")) saw_lib_out = true;
-                    }
+            for (size_t li = 0; li < link_toks.size(); ++li) {
+                const std::string& lt = link_toks[li];
+                std::string low_lt = lt;
+                std::replace(low_lt.begin(), low_lt.end(), '\\', '/');
+                low_lt = ToLowerCd(low_lt);
+                std::string fname_low = ToLowerCd(std::filesystem::u8path(lt).filename().generic_u8string());
 
-                    // Extract inter-target deps and external/system libs from link.txt / linkLibs.rsp
-                    if (lt.rfind("-l", 0) == 0 && lt.size() > 2) {
-                        std::string lname = lt.substr(2);
-                        if (lname != tname && seen_libs.insert(lname).second) {
-                            ts.libs.push_back(lname);
+                if (fname_low == "ar" || fname_low == "ar.exe" || fname_low == "gcc-ar" || fname_low == "gcc-ar.exe" ||
+                    fname_low == "llvm-ar" || fname_low == "llvm-ar.exe" || fname_low == "lib.exe") {
+                    saw_ar = true;
+                }
+                if (lt == "-shared" || lt == "/DLL" || lt == "/LD" || lt == "/LDd") {
+                    saw_shared = true;
+                }
+                if ((lt == "-o" || lt == "/OUT:") && li + 1 < link_toks.size()) {
+                    std::string out_arg = link_toks[li + 1];
+                    if (EndsWithCiCd(out_arg, ".exe")) saw_exe_out = true;
+                    else if (EndsWithCiCd(out_arg, ".dll") || EndsWithCiCd(out_arg, ".so") || EndsWithCiCd(out_arg, ".dylib")) saw_shared = true;
+                    else if (EndsWithCiCd(out_arg, ".a") || EndsWithCiCd(out_arg, ".lib")) saw_lib_out = true;
+                }
+                if (lt.rfind("/OUT:", 0) == 0) {
+                    if (EndsWithCiCd(lt, ".exe")) saw_exe_out = true;
+                    else if (EndsWithCiCd(lt, ".dll")) saw_shared = true;
+                    else if (EndsWithCiCd(lt, ".lib")) saw_lib_out = true;
+                }
+                if (lt == "-static" || lt == "-static-libgcc" || lt == "-static-libstdc++" ||
+                    lt == "-mwindows" || lt == "-mconsole") {
+                    if (seen_lflags.insert(lt).second) ts.linkFlags.push_back(lt);
+                }
+                // Detect CMake resource object files (e.g. CMakeFiles/foo.dir/assets/app.rc.obj)
+                if (EndsWithCiCd(fname_low, ".rc.obj") || EndsWithCiCd(fname_low, ".rc.res")) {
+                    std::string norm_rc = lt;
+                    std::replace(norm_rc.begin(), norm_rc.end(), '\\', '/');
+                    size_t dpos = norm_rc.find(".dir/");
+                    if (dpos != std::string::npos) {
+                        std::string rc_rel = norm_rc.substr(dpos + 5);
+                        if (EndsWithCiCd(rc_rel, ".obj") || EndsWithCiCd(rc_rel, ".res")) {
+                            rc_rel.resize(rc_rel.size() - 4);
                         }
-                    } else if ((EndsWithCiCd(lt, ".a") || EndsWithCiCd(lt, ".lib") || EndsWithCiCd(lt, ".dll.a") ||
-                                EndsWithCiCd(lt, ".so") || EndsWithCiCd(lt, ".dylib")) &&
-                               low_lt.find("cmakefiles/") == std::string::npos &&
-                               fname_low != "objects.a") {
-                        std::string cand = ExtractTargetTokenFromLibPath(lt);
-                        if (!cand.empty() && cand != tname && all_target_names.count(cand)) {
-                            if (seen_deps.insert(cand).second) ts.deps.push_back(cand);
-                        } else if (!cand.empty() && cand != tname && lt.find("-l") != 0 &&
-                                   lt.rfind("CMakeFiles", 0) != 0 && fname_low != ("lib" + ToLowerCd(tname) + ".a")) {
-                            std::string norm_lib = lt;
-                            std::replace(norm_lib.begin(), norm_lib.end(), '\\', '/');
-                            if (seen_libs.insert(norm_lib).second) ts.libs.push_back(norm_lib);
+                        if (!rc_rel.empty() && fs_util::ExistsLong(project_root / std::filesystem::u8path(rc_rel))) {
+                            if (seen_rc_files.insert(rc_rel).second) ts.files.push_back(rc_rel);
                         }
                     }
                 }
 
-                if (saw_shared) ts.kind = TargetKind::Shared;
-                else if (saw_exe_out) ts.kind = TargetKind::Executable;
-                else if (saw_ar || saw_lib_out) ts.kind = TargetKind::Static;
-                else ts.kind = TargetKind::Executable;
+                // Extract inter-target deps and external/system libs from link.txt / linkLibs.rsp
+                if (lt.rfind("-l", 0) == 0 && lt.size() > 2) {
+                    std::string lname = lt.substr(2);
+                    if (lname != tname && seen_libs.insert(lname).second) {
+                        ts.libs.push_back(lname);
+                    }
+                } else if (!lt.empty() && lt[0] != '-' &&
+                           (EndsWithCiCd(lt, ".a") || EndsWithCiCd(lt, ".lib") || EndsWithCiCd(lt, ".dll.a") ||
+                            EndsWithCiCd(lt, ".so") || EndsWithCiCd(lt, ".dylib")) &&
+                           low_lt.find("cmakefiles/") == std::string::npos &&
+                           fname_low != "objects.a") {
+                    std::string mapped_tgt;
+                    auto mit = lib_file_to_target.find(fname_low);
+                    if (mit != lib_file_to_target.end()) {
+                        mapped_tgt = mit->second;
+                    } else {
+                        std::string cand = ExtractTargetTokenFromLibPath(lt);
+                        if (all_target_names.count(cand)) {
+                            mapped_tgt = cand;
+                        } else {
+                            auto mit2 = lib_file_to_target.find(ToLowerCd(cand));
+                            if (mit2 != lib_file_to_target.end()) mapped_tgt = mit2->second;
+                        }
+                    }
+
+                    if (!mapped_tgt.empty()) {
+                        if (mapped_tgt != tname && seen_deps.insert(mapped_tgt).second) {
+                            ts.deps.push_back(mapped_tgt);
+                        }
+                    } else if (lt.rfind("CMakeFiles", 0) != 0 && fname_low != ("lib" + ToLowerCd(tname) + ".a")) {
+                        std::string resolved_lib = resolve_entry_path(lt, link_entry_dir);
+                        if (seen_libs.insert(resolved_lib).second) ts.libs.push_back(resolved_lib);
+                    }
+                }
             }
+
+            if (saw_shared) ts.kind = TargetKind::Shared;
+            else if (saw_exe_out) ts.kind = TargetKind::Executable;
+            else if (saw_ar || saw_lib_out) ts.kind = TargetKind::Static;
+            else ts.kind = TargetKind::Executable;
         }
 
         if (!resolved_from_link_txt) {
@@ -925,7 +1535,11 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
             fg.compileFlags = VectorIntersection(f_cf);
 
             auto dit = folder_disk_counts.find(frel);
-            if (!frel.empty() && dit != folder_disk_counts.end() && dit->second > 0 && fg.files.size() == dit->second) {
+            std::string frel_low = ToLowerCd(frel);
+            bool in_skipped_dir = (frel_low.rfind("build/", 0) == 0 || frel_low == "build" ||
+                                   frel_low.find("/_deps/") != std::string::npos ||
+                                   frel_low.find("/tests/") != std::string::npos || frel_low == "tests");
+            if (!in_skipped_dir && !frel.empty() && dit != folder_disk_counts.end() && dit->second > 0 && fg.files.size() == dit->second) {
                 fg.useFolderRule = true;
             }
             ts.folders.push_back(std::move(fg));
@@ -934,7 +1548,94 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
         plan.targets.push_back(std::move(ts));
     }
 
-    plan.warningsList.push_back("compile_commands.json lacks link information; review Target Kinds, Dependencies, and Libraries before building.");
+    // Import custom codegen BuildSteps (V2-6) from Ninja build.ninja or CMake build.make next to compile_commands.json
+    std::unordered_map<std::string, std::string> custom_target_by_output;
+    std::vector<ImportedCustomStepCandidate> custom_candidates;
+    std::filesystem::path ninja_manifest = compdb_dir / "build.ninja";
+    if (fs_util::ExistsLong(ninja_manifest)) {
+        custom_candidates = ExtractNinjaCustomSteps(ninja_manifest, compdb_dir, project_root, custom_target_by_output);
+    } else if (fs_util::ExistsLong(compdb_dir / "CMakeFiles")) {
+        custom_candidates = ExtractMakeCustomSteps(compdb_dir, project_root);
+    }
+
+    std::unordered_map<std::string, size_t> target_idx_map;
+    for (size_t i = 0; i < plan.targets.size(); ++i) {
+        target_idx_map[plan.targets[i].name] = i;
+    }
+
+    std::unordered_set<std::string> covered_gen_outputs;
+    std::unordered_set<std::string> seen_step_sigs;
+    if (!plan.targets.empty()) {
+        for (auto& cand : custom_candidates) {
+            std::string sig = cand.step.command;
+            for (const auto& o : cand.step.outputs) sig += "|" + ToLowerCd(o);
+            if (!seen_step_sigs.insert(sig).second) continue;
+
+            size_t owner_idx = 0;
+            bool owner_found = false;
+            for (const auto& o : cand.step.outputs) {
+                std::string o_low = ToLowerCd(o);
+                auto git = gen_tu_target_by_rel.find(o_low);
+                if (git != gen_tu_target_by_rel.end()) {
+                    auto tit = target_idx_map.find(git->second);
+                    if (tit != target_idx_map.end()) {
+                        owner_idx = tit->second;
+                        owner_found = true;
+                        break;
+                    }
+                }
+                auto nit = custom_target_by_output.find(o_low);
+                if (!owner_found && nit != custom_target_by_output.end()) {
+                    auto tit = target_idx_map.find(nit->second);
+                    if (tit != target_idx_map.end()) {
+                        owner_idx = tit->second;
+                        owner_found = true;
+                        break;
+                    }
+                }
+            }
+            if (!owner_found && !cand.preferredTarget.empty()) {
+                auto tit = target_idx_map.find(cand.preferredTarget);
+                if (tit != target_idx_map.end()) {
+                    owner_idx = tit->second;
+                    owner_found = true;
+                }
+            }
+
+            // Ensure unique step names within the owning target
+            auto& dest_steps = plan.targets[owner_idx].steps;
+            std::string base_name = cand.step.name;
+            int dup_idx = 2;
+            while (std::any_of(dest_steps.begin(), dest_steps.end(), [&](const BuildStep& s) { return s.name == cand.step.name; })) {
+                cand.step.name = base_name + " (" + std::to_string(dup_idx++) + ")";
+            }
+
+            for (const auto& o : cand.step.outputs) {
+                covered_gen_outputs.insert(ToLowerCd(o));
+            }
+            dest_steps.push_back(std::move(cand.step));
+            plan.importedStepCount++;
+        }
+    }
+
+    for (const auto& rec : excluded_gen_records) {
+        if (covered_gen_outputs.find(ToLowerCd(rec.fileRel)) != covered_gen_outputs.end()) {
+            continue;
+        }
+        if (plan.warningsList.size() < 40) {
+            plan.warningsList.push_back(
+                rec.fileName + " generated by original build system; recreate with a build step (V2-6)."
+            );
+        }
+    }
+
+    if (plan.importedStepCount > 0) {
+        plan.warningsList.push_back(
+            "Imported " + std::to_string(plan.importedStepCount) +
+            " custom codegen build step(s); project will require trust confirmation before executing steps."
+        );
+    }
+    plan.warningsList.push_back("Review Target Kinds, Dependencies, and Libraries if the source build used non-CMake tools.");
     plan.success = true;
     return plan;
 }
@@ -978,10 +1679,12 @@ bool CompDbManager::WriteImportedProject(
         t.kind = ts.kind;
         t.deps = ts.deps;
         t.priv.libs = ts.libs;
+        t.priv.linkFlags = ts.linkFlags;
         t.priv.includeDirs = ts.includeDirs;
         t.priv.systemIncludeDirs = ts.systemIncludeDirs;
         t.priv.defines = ts.defines;
         t.priv.compileFlags = ts.compileFlags;
+        t.steps = ts.steps;
 
         std::unordered_set<std::string> covered_by_rule;
         for (const auto& fg : ts.folders) {

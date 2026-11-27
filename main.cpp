@@ -702,7 +702,9 @@ int main(int argc, char* argv[]) {
             std::cerr << "Import write failed: " << werr << "\n";
             return 1;
         }
-        std::cout << "Imported " << plan.targets.size() << " target(s) from " << cc_path.generic_u8string()
+        std::cout << "Imported " << plan.targets.size() << " target(s)"
+                  << (plan.importedStepCount > 0 ? (" and " + std::to_string(plan.importedStepCount) + " codegen step(s)") : "")
+                  << " from " << cc_path.generic_u8string()
                   << " into " << root_dir.generic_u8string() << "\n";
         for (const auto& w : plan.warningsList) {
             std::cout << "  Warning: " << w << "\n";

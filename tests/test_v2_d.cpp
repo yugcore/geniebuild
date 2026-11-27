@@ -469,6 +469,150 @@ static void TestCompileCommandsImport() {
     core::fs_util::RemoveAllLong(tmp, ec);
 }
 
+static void TestCompileCommandsCustomCodegenImport() {
+    std::cout << "[TEST] TestCompileCommandsCustomCodegenImport...\n";
+    // 1) Ninja build.ninja CUSTOM_COMMAND import (generates .cpp + .inc + unwraps cmd.exe /C)
+    {
+        fs::path tmp = MakeTempDir("v2d_compdb_ninja_codegen");
+        WriteText(tmp / "src/app/main.cpp",
+            "#include \"gen_val.inc\"\nint gen_fn();\nint main() { return (gen_fn() + GEN_INC_VAL == 42) ? 0 : 1; }\n");
+        WriteText(tmp / "proto/spec.txt", "42\n");
+        WriteText(tmp / "tools/gen_code.py",
+            "import sys, pathlib\n"
+            "mode, out_p = sys.argv[1], pathlib.Path(sys.argv[2])\n"
+            "out_p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "if mode == 'inc':\n"
+            "    out_p.write_text('#define GEN_INC_VAL 30\\n', encoding='utf-8')\n"
+            "else:\n"
+            "    out_p.write_text('int gen_fn() { return 12; }\\n', encoding='utf-8')\n");
+
+        nlohmann::json arr = nlohmann::json::array();
+        arr.push_back({
+            {"directory", (tmp / "build").generic_u8string()},
+            {"file", (tmp / "src/app/main.cpp").generic_u8string()},
+            {"output", "CMakeFiles/app.dir/src/app/main.cpp.obj"},
+            {"arguments", nlohmann::json::array({
+                "g++", "-I" + (tmp / "build/gen").generic_u8string(), "-std=c++17", "-c",
+                (tmp / "src/app/main.cpp").generic_u8string(), "-o", "CMakeFiles/app.dir/src/app/main.cpp.obj"
+            })}
+        });
+        arr.push_back({
+            {"directory", (tmp / "build").generic_u8string()},
+            {"file", (tmp / "build/gen/gen_src.cpp").generic_u8string()},
+            {"output", "CMakeFiles/app.dir/gen/gen_src.cpp.obj"},
+            {"arguments", nlohmann::json::array({
+                "g++", "-std=c++17", "-c", (tmp / "build/gen/gen_src.cpp").generic_u8string(),
+                "-o", "CMakeFiles/app.dir/gen/gen_src.cpp.obj"
+            })}
+        });
+
+        WriteText(tmp / "build/compile_commands.json", arr.dump(2));
+        WriteText(tmp / "build/CMakeFiles/app.dir/link.txt",
+            "g++ CMakeFiles/app.dir/src/app/main.cpp.obj CMakeFiles/app.dir/gen/gen_src.cpp.obj -o app.exe\n");
+
+        std::string ninja_src =
+            "cmake_ninja_workdir = " + (tmp / "build").generic_u8string() + "/\n"
+            "build gen/gen_val.inc: CUSTOM_COMMAND ../proto/spec.txt\n"
+            "  COMMAND = C:\\WINDOWS\\system32\\cmd.exe /C \"cd /D " + (tmp / "build").generic_u8string() +
+            " && python " + (tmp / "tools/gen_code.py").generic_u8string() + " inc gen/gen_val.inc\"\n"
+            "  DESC = Generating gen_val.inc\n"
+            "build gen/gen_src.cpp: CUSTOM_COMMAND ../proto/spec.txt | gen/gen_val.inc\n"
+            "  COMMAND = python " + (tmp / "tools/gen_code.py").generic_u8string() + " cpp gen/gen_src.cpp\n"
+            "  DESC = Generating gen_src.cpp\n"
+            "build cmake_object_order_depends_target_app: phony || gen/gen_val.inc\n";
+        WriteText(tmp / "build/build.ninja", ninja_src);
+
+        core::ImportPlan plan = core::CompDbManager::AnalyzeCompileCommands(tmp / "build/compile_commands.json", tmp);
+        CHECK(plan.success);
+        CHECK(plan.importedStepCount == 2);
+        CHECK(plan.targets.size() == 1);
+        CHECK(plan.targets[0].steps.size() == 2);
+
+        bool has_inc_step = false, has_cpp_step = false;
+        for (const auto& st : plan.targets[0].steps) {
+            if (st.name == "Generating gen_val.inc") {
+                has_inc_step = true;
+                CHECK(!st.generatesSources);
+                CHECK(st.command.find("cmd.exe") == std::string::npos);
+            }
+            if (st.name == "Generating gen_src.cpp") {
+                has_cpp_step = true;
+                CHECK(st.generatesSources);
+            }
+        }
+        CHECK(has_inc_step && has_cpp_step);
+
+        // Generated gen_src.cpp is covered by an imported step -> no manual-recreate warning
+        for (const auto& w : plan.warningsList) {
+            CHECK(w.find("recreate with a build step") == std::string::npos);
+        }
+
+        std::string werr;
+        CHECK(core::CompDbManager::WriteImportedProject(plan, tmp, werr));
+
+        // Verify imported project actually executes codegen steps + compiles + links + exits 0!
+        core::Project proj;
+        CHECK(proj.Load(tmp));
+        core::TrustStore::SetTrusted(tmp, true);
+        core::CompilerManager cm;
+        core::BuildRunner runner;
+        std::string berr;
+        CHECK(runner.StartBuild(proj, cm, berr, "app"));
+        while (runner.IsRunning()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!runner.GetLastResult().success) {
+            for (const auto& l : runner.DrainOutput()) std::cerr << "  [codegen build] " << l.text << "\n";
+        }
+        CHECK(runner.GetLastResult().success);
+        CHECK(fs::exists(tmp / "build/gen/gen_val.inc"));
+        CHECK(fs::exists(tmp / "build/gen/gen_src.cpp"));
+
+        std::error_code ec;
+        core::fs_util::RemoveAllLong(tmp, ec);
+    }
+
+    // 2) CMake Makefile CMakeFiles/<target>.dir/build.make custom command import
+    {
+        fs::path tmp = MakeTempDir("v2d_compdb_make_codegen");
+        WriteText(tmp / "src/main.cpp", "int main() { return 0; }\n");
+        WriteText(tmp / "schema.proto", "message M {}\n");
+
+        nlohmann::json arr = nlohmann::json::array();
+        arr.push_back({
+            {"directory", (tmp / "build").generic_u8string()},
+            {"file", (tmp / "src/main.cpp").generic_u8string()},
+            {"output", "CMakeFiles/svc.dir/src/main.cpp.obj"},
+            {"arguments", nlohmann::json::array({ "g++", "-c", "../src/main.cpp", "-o", "CMakeFiles/svc.dir/src/main.cpp.obj" })}
+        });
+        arr.push_back({
+            {"directory", (tmp / "build").generic_u8string()},
+            {"file", (tmp / "build/msg.pb.cc").generic_u8string()},
+            {"output", "CMakeFiles/svc.dir/msg.pb.cc.obj"},
+            {"arguments", nlohmann::json::array({ "g++", "-c", "msg.pb.cc", "-o", "CMakeFiles/svc.dir/msg.pb.cc.obj" })}
+        });
+        WriteText(tmp / "build/compile_commands.json", arr.dump(2));
+        WriteText(tmp / "build/CMakeFiles/svc.dir/link.txt",
+            "g++ CMakeFiles/svc.dir/src/main.cpp.obj CMakeFiles/svc.dir/msg.pb.cc.obj -o svc.exe\n");
+        WriteText(tmp / "build/CMakeFiles/svc.dir/build.make",
+            "CMAKE_COMMAND = cmake\n"
+            "msg.pb.cc: " + (tmp / "schema.proto").generic_u8string() + "\n"
+            "\t@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --blue \"Generating msg.pb.cc\"\n"
+            "\tpython gen_pb.py " + (tmp / "schema.proto").generic_u8string() + " msg.pb.cc\n");
+
+        core::ImportPlan plan = core::CompDbManager::AnalyzeCompileCommands(tmp / "build/compile_commands.json", tmp);
+        CHECK(plan.success);
+        CHECK(plan.importedStepCount == 1);
+        CHECK(plan.targets.size() == 1);
+        CHECK(plan.targets[0].steps.size() == 1);
+        CHECK(plan.targets[0].steps[0].generatesSources);
+        CHECK(plan.targets[0].steps[0].command.find("python gen_pb.py") != std::string::npos);
+
+        std::error_code ec;
+        core::fs_util::RemoveAllLong(tmp, ec);
+    }
+}
+
 int main() {
     std::cout << std::unitbuf;
     TestChildProcessStressAndCancel();
@@ -476,6 +620,7 @@ int main() {
     TestProgressSummaryAnd2MLineLog();
     TestLongPathsShortObjectsAndDefender();
     TestCompileCommandsImport();
+    TestCompileCommandsCustomCodegenImport();
     std::cout << "ALL V2-D TESTS PASSED\n";
     return 0;
 }

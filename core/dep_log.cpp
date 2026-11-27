@@ -69,6 +69,16 @@ DepLog::~DepLog() {
 
 std::string DepLog::NormalizeDepPath(const std::string& path_str) {
     if (path_str.empty()) return "";
+    // Fast lexical path avoids std::filesystem::path parsing on already-normalized clean paths
+    if (path_str.back() != '/' && path_str.find('\\') == std::string::npos &&
+        path_str.find("//") == std::string::npos && path_str.find("/.") == std::string::npos &&
+        path_str.rfind("./", 0) != 0 && path_str != "." && path_str != "..") {
+#if defined(_WIN32)
+        return ToLowerDep(path_str);
+#else
+        return path_str;
+#endif
+    }
     std::filesystem::path p = std::filesystem::u8path(path_str).lexically_normal();
     std::string norm = p.generic_u8string();
     while (norm.rfind("./", 0) == 0) {
@@ -596,6 +606,58 @@ size_t DepLog::GetTrackedOutputCount() const {
     return m_outputs.size();
 }
 
+void DepLog::CollectTrackedStatPaths(
+    const std::vector<std::string>& norm_output_paths,
+    std::vector<std::string>& out_paths
+) const {
+    std::lock_guard<std::mutex> lock(m_data_mutex);
+    if (m_id_to_path.empty() || m_outputs.empty()) return;
+    std::vector<uint8_t> seen(m_id_to_path.size() + 1, 0);
+    for (const auto& norm : norm_output_paths) {
+        auto pid_it = m_path_to_id.find(norm);
+        if (pid_it == m_path_to_id.end()) continue;
+        auto oit = m_outputs.find(pid_it->second);
+        if (oit == m_outputs.end()) continue;
+        for (uint32_t did : oit->second.depIds) {
+            if (did > 0 && did <= m_id_to_path.size() && !seen[did]) {
+                seen[did] = 1;
+                out_paths.push_back(m_id_to_path[did - 1]);
+            }
+        }
+    }
+}
+
+std::vector<int64_t> DepLog::BuildIdMtimeTable(
+    const std::unordered_map<std::string, int64_t>& stat_map
+) const {
+    std::lock_guard<std::mutex> lock(m_data_mutex);
+    std::vector<int64_t> table(m_id_to_path.size() + 1, 0);
+    for (size_t idx = 0; idx < m_id_to_path.size(); ++idx) {
+        auto it = stat_map.find(m_id_to_path[idx]);
+        if (it != stat_map.end()) {
+            table[idx + 1] = it->second;
+        }
+    }
+    return table;
+}
+
+void DepLog::LookupOutputsBatch(
+    const std::vector<std::string>& norm_output_paths,
+    std::vector<DepOutputEntry>& out_entries
+) const {
+    out_entries.clear();
+    out_entries.resize(norm_output_paths.size());
+    std::lock_guard<std::mutex> lock(m_data_mutex);
+    for (size_t i = 0; i < norm_output_paths.size(); ++i) {
+        auto pid_it = m_path_to_id.find(norm_output_paths[i]);
+        if (pid_it == m_path_to_id.end()) continue;
+        auto oit = m_outputs.find(pid_it->second);
+        if (oit != m_outputs.end()) {
+            out_entries[i] = oit->second;
+        }
+    }
+}
+
 std::unordered_map<std::string, int64_t> DepLog::BatchStatFiles(
     const std::vector<std::string>& raw_or_norm_paths,
     int num_threads
@@ -606,9 +668,11 @@ std::unordered_map<std::string, int64_t> DepLog::BatchStatFiles(
     };
 
     std::unordered_map<std::string, std::vector<TargetItem>> by_dir;
+    std::unordered_set<std::string> seen_norm;
+    seen_norm.reserve(raw_or_norm_paths.size());
     for (const auto& raw : raw_or_norm_paths) {
         std::string norm = NormalizeDepPath(raw);
-        if (norm.empty()) continue;
+        if (norm.empty() || !seen_norm.insert(norm).second) continue;
         std::filesystem::path p = std::filesystem::u8path(norm);
         std::string dir = p.parent_path().generic_u8string();
         std::string fname = p.filename().generic_u8string();

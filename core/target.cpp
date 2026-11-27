@@ -445,20 +445,20 @@ static void CollectLinkRequirements(
 ) {
     if (!visited.insert(dep_target.name).second) return;
 
-    // If dep is static or interface, its own deps & publicDeps must also reach the final link.
-    // If dep is shared, its publicDeps propagate too.
+    // Visit transitive deps in reverse sibling order so reversing post_order_deps
+    // keeps explicit sibling order intact while still placing dependents before deps.
+    for (auto pit = dep_target.publicDeps.rbegin(); pit != dep_target.publicDeps.rend(); ++pit) {
+        auto it = target_map.find(*pit);
+        if (it != target_map.end()) {
+            CollectLinkRequirements(project, *it->second, target_map, config, is_msvc, visited, post_order_deps);
+        }
+    }
     if (dep_target.kind == TargetKind::Static || dep_target.kind == TargetKind::Interface) {
-        for (const auto& d : dep_target.deps) {
-            auto it = target_map.find(d);
+        for (auto dit = dep_target.deps.rbegin(); dit != dep_target.deps.rend(); ++dit) {
+            auto it = target_map.find(*dit);
             if (it != target_map.end()) {
                 CollectLinkRequirements(project, *it->second, target_map, config, is_msvc, visited, post_order_deps);
             }
-        }
-    }
-    for (const auto& pd : dep_target.publicDeps) {
-        auto it = target_map.find(pd);
-        if (it != target_map.end()) {
-            CollectLinkRequirements(project, *it->second, target_map, config, is_msvc, visited, post_order_deps);
         }
     }
 
@@ -570,14 +570,14 @@ EffectiveTargetSettings ResolveEffectiveTargetSettings(
     link_visited.insert(target.name);
     std::vector<const Target*> post_order_deps;
 
-    for (const auto& d : target.deps) {
-        auto it = target_map.find(d);
+    for (auto pit = target.publicDeps.rbegin(); pit != target.publicDeps.rend(); ++pit) {
+        auto it = target_map.find(*pit);
         if (it != target_map.end()) {
             CollectLinkRequirements(project, *it->second, target_map, config, is_msvc, link_visited, post_order_deps);
         }
     }
-    for (const auto& pd : target.publicDeps) {
-        auto it = target_map.find(pd);
+    for (auto dit = target.deps.rbegin(); dit != target.deps.rend(); ++dit) {
+        auto it = target_map.find(*dit);
         if (it != target_map.end()) {
             CollectLinkRequirements(project, *it->second, target_map, config, is_msvc, link_visited, post_order_deps);
         }

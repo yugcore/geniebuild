@@ -712,11 +712,14 @@ void Project::RefreshMissingFilesCache() {
     if (total_files > 64) {
         std::vector<std::string> unique_abs;
         unique_abs.reserve(total_files);
-        std::unordered_set<std::string> seen_rel;
+        std::unordered_map<std::string, std::string> rel_to_norm;
+        rel_to_norm.reserve(total_files);
         for (const auto& t : m_targets) {
             for (const auto& file : t.expandedFiles) {
-                if (seen_rel.insert(file).second) {
-                    unique_abs.push_back(ResolvePath(file).generic_u8string());
+                if (rel_to_norm.find(file) == rel_to_norm.end()) {
+                    std::string abs_s = ResolvePath(file).generic_u8string();
+                    rel_to_norm.emplace(file, DepLog::NormalizeDepPath(abs_s));
+                    unique_abs.push_back(std::move(abs_s));
                 }
             }
         }
@@ -726,7 +729,7 @@ void Project::RefreshMissingFilesCache() {
             t.missingFilesSet.clear();
             t.missingFiles.clear();
             for (const auto& file : t.expandedFiles) {
-                std::string norm = DepLog::NormalizeDepPath(ResolvePath(file).generic_u8string());
+                const std::string& norm = rel_to_norm[file];
                 if (stat_map.find(norm) == stat_map.end()) {
                     t.missingFilesSet.insert(file);
                     t.missingFiles.push_back(file);

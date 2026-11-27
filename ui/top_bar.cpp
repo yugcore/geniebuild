@@ -1474,8 +1474,8 @@ void RenderToolBar(
         if (!s_ImportPlan.success) {
             ImGui::TextColored(Theme::Col::Error, "%s", s_ImportPlan.error.c_str());
         } else {
-            ImGui::TextColored(Theme::Col::TextDim, "Parsed %zu entries -> %zu suggested targets (%zu generated excluded).",
-                s_ImportPlan.totalEntriesParsed, s_ImportPlan.targets.size(), s_ImportPlan.excludedGeneratedCount);
+            ImGui::TextColored(Theme::Col::TextDim, "Parsed %zu entries -> %zu suggested targets (%zu codegen steps imported, %zu generated excluded).",
+                s_ImportPlan.totalEntriesParsed, s_ImportPlan.targets.size(), s_ImportPlan.importedStepCount, s_ImportPlan.excludedGeneratedCount);
 
             // Left: targets list
             ImGui::BeginChild("ImpTargetsLeft", ImVec2(240.0f * dpi, 320.0f * dpi), true);
@@ -1511,8 +1511,8 @@ void RenderToolBar(
                 ImGui::Separator();
                 ImGui::TextColored(Theme::Col::Text, "Factored Project Includes (%zu), Defines (%zu), Flags (%zu)",
                     s_ImportPlan.projectIncludeDirs.size(), s_ImportPlan.projectDefines.size(), s_ImportPlan.projectCompileFlags.size());
-                ImGui::TextColored(Theme::Col::Text, "Target Includes (%zu), Defines (%zu), Flags (%zu), Folder groups (%zu)",
-                    ts.includeDirs.size(), ts.defines.size(), ts.compileFlags.size(), ts.folders.size());
+                ImGui::TextColored(Theme::Col::Text, "Target Includes (%zu), Defines (%zu), Flags (%zu), Folder groups (%zu), Steps (%zu)",
+                    ts.includeDirs.size(), ts.defines.size(), ts.compileFlags.size(), ts.folders.size(), ts.steps.size());
                 for (const auto& inc : ts.includeDirs) {
                     ImGui::TextColored(Theme::Col::TextDim, "  -I %s", inc.c_str());
                 }
