@@ -201,6 +201,7 @@ public:
     bool IsMultiTargetOrRulesUI() const;
 
     bool AddTarget(const Target& target, std::string& out_error);
+    bool SetTargetsBatch(const std::vector<Target>& targets, const std::string& startup_target, std::string& out_error, bool expand_rules = true);
     bool RemoveTarget(const std::string& name, std::string& out_error);
     bool RenameTarget(const std::string& old_name, const std::string& new_name, std::string& out_error);
     bool DuplicateTarget(const std::string& name, std::string& out_new_name);

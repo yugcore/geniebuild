@@ -1068,6 +1068,58 @@ bool Project::AddTarget(const Target& target, std::string& out_error) {
     return true;
 }
 
+bool Project::SetTargetsBatch(
+    const std::vector<Target>& targets,
+    const std::string& startup_target,
+    std::string& out_error,
+    bool expand_rules
+) {
+    out_error.clear();
+    if (targets.empty()) {
+        out_error = "Target list cannot be empty.";
+        return false;
+    }
+    std::unordered_set<std::string> seen_names;
+    for (const auto& t : targets) {
+        if (t.name.empty()) {
+            out_error = "Target name cannot be empty.";
+            return false;
+        }
+        if (!seen_names.insert(t.name).second) {
+            out_error = "Duplicate target named '" + t.name + "'.";
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_data_mutex);
+        m_targets = targets;
+        if (!startup_target.empty() && seen_names.count(startup_target)) {
+            m_startup_target = startup_target;
+        } else {
+            m_startup_target.clear();
+            for (const auto& t : m_targets) {
+                if (t.kind == TargetKind::Executable) {
+                    m_startup_target = t.name;
+                    break;
+                }
+            }
+            if (m_startup_target.empty()) {
+                m_startup_target = m_targets[0].name;
+            }
+        }
+        if (!expand_rules) {
+            SyncTargetsLocked();
+        }
+    }
+    if (expand_rules) {
+        ExpandAllSourceRules(false);
+    } else {
+        m_revision++;
+    }
+    MarkDirty();
+    return true;
+}
+
 bool Project::RemoveTarget(const std::string& name, std::string& out_error) {
     out_error.clear();
     {
@@ -2176,7 +2228,11 @@ bool Project::SaveImmediate() const {
         }
         std::error_code rename_ec;
         fs_util::RenameReplaceLong(tmp_file, project_file, rename_ec);
-        return !rename_ec;
+        if (!rename_ec) {
+            m_save_dirty = false;
+            return true;
+        }
+        return false;
     } catch (...) {
         return false;
     }

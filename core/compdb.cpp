@@ -808,7 +808,9 @@ bool CompDbManager::WriteImportedProject(
     proj.SetDefines(plan.projectDefines);
     proj.SetCompileFlags(plan.projectCompileFlags);
 
-    // Preserve first executable as startup target
+    // Preserve first executable as startup target and batch-assign targets without O(T^2) re-expansion
+    std::vector<Target> built_targets;
+    built_targets.reserve(plan.targets.size());
     std::string startup;
     for (size_t i = 0; i < plan.targets.size(); ++i) {
         const auto& ts = plan.targets[i];
@@ -848,17 +850,16 @@ bool CompDbManager::WriteImportedProject(
         if (startup.empty() && t.kind == TargetKind::Executable) {
             startup = t.name;
         }
-        std::string aerr;
-        if (!proj.AddTarget(t, aerr)) {
-            out_error = aerr;
-            return false;
-        }
+        built_targets.push_back(std::move(t));
     }
-    if (startup.empty() && !plan.targets.empty()) {
-        startup = plan.targets[0].name;
+    if (startup.empty() && !built_targets.empty()) {
+        startup = built_targets[0].name;
     }
-    if (!startup.empty()) {
-        proj.SetStartupTarget(startup);
+
+    std::string berr;
+    if (!proj.SetTargetsBatch(built_targets, startup, berr, false)) {
+        out_error = berr;
+        return false;
     }
 
     if (!proj.SaveImmediate()) {
