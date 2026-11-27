@@ -2530,10 +2530,41 @@ void BuildRunner::WorkerRun(
         cache_summary = CompilerCacheManager::ComputeDelta(compiler_cache, cache_before, cache_after);
     }
 
-    // V2-19 Export compile_commands.json after build plan (even if build failed, unless disabled)
+    // V2-19 Export compile_commands.json after build plan (skip redundant export if project/toolchain unchanged and output exists)
     CompDbExportResult compdb_res;
-    if (project.GetCompileCommandsConfig().enabled && !was_cancelled) {
-        compdb_res = CompDbManager::ExportCompileCommands(project, compiler_manager, active_tc);
+    const CompileCommandsConfig cc_cfg = project.GetCompileCommandsConfig();
+    if (cc_cfg.enabled && !was_cancelled) {
+        std::filesystem::path cc_out_path = cc_cfg.path.empty()
+            ? (project.GetRootPath() / "compile_commands.json")
+            : project.ResolvePath(cc_cfg.path);
+        std::string cc_cfg_key = cc_cfg.path + "|" + (cc_cfg.allConfigs ? "1" : "0");
+        uint64_t cur_rev = project.Revision();
+        bool can_skip_compdb = false;
+        {
+            std::lock_guard<std::mutex> rlk(m_result_mutex);
+            can_skip_compdb = (total_steps_run.load() == 0) &&
+                              (cur_rev != 0 && cur_rev == m_last_compdb_revision) &&
+                              (project.GetRootPath() == m_last_compdb_root) &&
+                              (config == m_last_compdb_config) &&
+                              (tc_hash8 == m_last_compdb_tc) &&
+                              (cc_cfg_key == m_last_compdb_cfg_key) &&
+                              fs_util::ExistsLong(cc_out_path);
+        }
+        if (can_skip_compdb) {
+            compdb_res.success = true;
+            compdb_res.fileModified = false;
+            compdb_res.outputPath = cc_out_path;
+        } else {
+            compdb_res = CompDbManager::ExportCompileCommands(project, compiler_manager, active_tc);
+            if (compdb_res.success) {
+                std::lock_guard<std::mutex> rlk(m_result_mutex);
+                m_last_compdb_revision = cur_rev;
+                m_last_compdb_root = project.GetRootPath();
+                m_last_compdb_config = config;
+                m_last_compdb_tc = tc_hash8;
+                m_last_compdb_cfg_key = cc_cfg_key;
+            }
+        }
     }
 
     // 4. Post-link DLL copying (§5.1.2)

@@ -1,6 +1,7 @@
 #include "project.h"
 #include "settings_resolver.h"
 #include "fs_util.h"
+#include "dep_log.h"
 
 #include <nlohmann/json.hpp>
 
@@ -702,6 +703,42 @@ void Project::RefreshMissingFilesCache() {
     std::lock_guard<std::mutex> lock(m_data_mutex);
     m_missing_files_set.clear();
     m_missing_files.clear();
+
+    size_t total_files = 0;
+    for (const auto& t : m_targets) {
+        total_files += t.expandedFiles.size();
+    }
+
+    if (total_files > 64) {
+        std::vector<std::string> unique_abs;
+        unique_abs.reserve(total_files);
+        std::unordered_set<std::string> seen_rel;
+        for (const auto& t : m_targets) {
+            for (const auto& file : t.expandedFiles) {
+                if (seen_rel.insert(file).second) {
+                    unique_abs.push_back(ResolvePath(file).generic_u8string());
+                }
+            }
+        }
+        auto stat_map = DepLog::BatchStatFiles(unique_abs, 0);
+        std::unordered_set<std::string> checked;
+        for (auto& t : m_targets) {
+            t.missingFilesSet.clear();
+            t.missingFiles.clear();
+            for (const auto& file : t.expandedFiles) {
+                std::string norm = DepLog::NormalizeDepPath(ResolvePath(file).generic_u8string());
+                if (stat_map.find(norm) == stat_map.end()) {
+                    t.missingFilesSet.insert(file);
+                    t.missingFiles.push_back(file);
+                    if (checked.insert(file).second) {
+                        m_missing_files_set.insert(file);
+                        m_missing_files.push_back(file);
+                    }
+                }
+            }
+        }
+        return;
+    }
 
     std::unordered_set<std::string> checked;
     for (auto& t : m_targets) {

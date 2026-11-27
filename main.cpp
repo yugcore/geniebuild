@@ -25,6 +25,7 @@
 // Core project management
 #include "core/project.h"
 #include "core/compiler.h"
+#include "core/compdb.h"
 #include "core/build_runner.h"
 #include "core/build_steps.h"
 #include "core/run_runner.h"
@@ -642,17 +643,27 @@ static void RenderFrame(GLFWwindow* window) {
 }
 
 int main(int argc, char* argv[]) {
-    // Headless CLI mode (§0.4): geniebuild --build [--target T] [--config C] [--toolchain N] [--trust] <path>
+    // Headless CLI mode (§0.4):
+    //   geniebuild --build [--target T] [--config C] [--toolchain N] [--trust] <path>
+    //   geniebuild --import [--root <project_dir>] <compile_commands.json>
     bool cli_build = false;
+    bool cli_import = false;
     bool cli_trust = false;
     std::string cli_target;
     std::string cli_config;
     std::string cli_toolchain;
+    std::filesystem::path cli_import_root;
     std::filesystem::path cli_project_path;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i] ? argv[i] : "";
         if (arg == "--build") {
             cli_build = true;
+        } else if (arg == "--import") {
+            cli_import = true;
+        } else if (arg == "--root" && i + 1 < argc) {
+            std::error_code ec;
+            std::filesystem::path p = std::filesystem::absolute(std::filesystem::u8path(argv[++i]), ec);
+            if (!ec) cli_import_root = p;
         } else if (arg == "--trust") {
             cli_trust = true;
         } else if (arg == "--target" && i + 1 < argc) {
@@ -666,6 +677,37 @@ int main(int argc, char* argv[]) {
             std::filesystem::path p = std::filesystem::absolute(std::filesystem::u8path(arg), ec);
             if (!ec) cli_project_path = p;
         }
+    }
+
+    if (cli_import) {
+        std::filesystem::path cc_path = cli_project_path;
+        if (cc_path.empty()) {
+            cc_path = std::filesystem::current_path() / "compile_commands.json";
+        }
+        std::filesystem::path root_dir = cli_import_root;
+        if (root_dir.empty()) {
+            root_dir = cc_path.parent_path();
+            if (root_dir.filename() == "build" || root_dir.filename() == "cmbuild" ||
+                root_dir.filename() == "out" || root_dir.filename().generic_u8string().rfind("cmake-build-", 0) == 0) {
+                root_dir = root_dir.parent_path();
+            }
+        }
+        core::ImportPlan plan = core::CompDbManager::AnalyzeCompileCommands(cc_path, root_dir);
+        if (!plan.success) {
+            std::cerr << "Import analysis failed: " << plan.error << "\n";
+            return 1;
+        }
+        std::string werr;
+        if (!core::CompDbManager::WriteImportedProject(plan, root_dir, werr)) {
+            std::cerr << "Import write failed: " << werr << "\n";
+            return 1;
+        }
+        std::cout << "Imported " << plan.targets.size() << " target(s) from " << cc_path.generic_u8string()
+                  << " into " << root_dir.generic_u8string() << "\n";
+        for (const auto& w : plan.warningsList) {
+            std::cout << "  Warning: " << w << "\n";
+        }
+        return 0;
     }
 
     if (cli_build) {

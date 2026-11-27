@@ -34,6 +34,7 @@ struct ImportedTargetSuggestion {
     std::string name;
     TargetKind kind = TargetKind::Executable;
     std::vector<std::string> deps;
+    std::vector<std::string> libs;
     std::vector<std::string> files;
     std::vector<std::string> includeDirs;
     std::vector<std::string> systemIncludeDirs;

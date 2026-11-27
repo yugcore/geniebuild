@@ -203,6 +203,7 @@ void ExpandResponseFilesRecursive(
     const std::filesystem::path& entry_dir,
     const std::filesystem::path& project_root,
     std::vector<std::string>& out_args,
+    std::unordered_map<std::string, std::vector<std::string>>& rsp_cache,
     int depth = 0
 ) {
     for (const std::string& a : raw_args) {
@@ -219,15 +220,63 @@ void ExpandResponseFilesRecursive(
                 if (fs_util::ExistsLong(cand1)) rp = cand1;
                 else rp = project_root / rp;
             }
+            std::string cache_key = ToLowerCd(rp.lexically_normal().generic_u8string());
+            auto cit = rsp_cache.find(cache_key);
+            if (cit != rsp_cache.end()) {
+                ExpandResponseFilesRecursive(cit->second, rp.parent_path(), project_root, out_args, rsp_cache, depth + 1);
+                continue;
+            }
             std::string rsp_text;
             if (fs_util::ReadFileTextLong(rp, rsp_text)) {
                 std::vector<std::string> rsp_toks = CompDbManager::SplitCommandLine(rsp_text);
-                ExpandResponseFilesRecursive(rsp_toks, rp.parent_path(), project_root, out_args, depth + 1);
+                auto& cached = rsp_cache[cache_key];
+                cached = rsp_toks;
+                ExpandResponseFilesRecursive(cached, rp.parent_path(), project_root, out_args, rsp_cache, depth + 1);
                 continue;
             }
         }
         out_args.push_back(a);
     }
+}
+
+std::string ExtractTargetTokenFromLibPath(const std::string& tok) {
+    std::string low = ToLowerCd(tok);
+    std::filesystem::path p = std::filesystem::u8path(tok);
+    std::string fname = p.filename().generic_u8string();
+    std::string flow = ToLowerCd(fname);
+    if (flow.size() > 6 && flow.rfind(".dll.a") == flow.size() - 6) {
+        fname.resize(fname.size() - 6);
+    } else if (flow.size() > 4 && flow.rfind(".lib") == flow.size() - 4) {
+        fname.resize(fname.size() - 4);
+    } else if (flow.size() > 6 && flow.rfind(".dylib") == flow.size() - 6) {
+        fname.resize(fname.size() - 6);
+    } else if (flow.size() > 3 && flow.rfind(".so") == flow.size() - 3) {
+        fname.resize(fname.size() - 3);
+    } else if (flow.size() > 2 && flow.rfind(".a") == flow.size() - 2) {
+        fname.resize(fname.size() - 2);
+    } else {
+        return "";
+    }
+    if (fname.rfind("lib", 0) == 0 && fname.size() > 3) {
+        fname = fname.substr(3);
+    }
+    return fname;
+}
+
+bool EndsWithCiCd(const std::string& s, const std::string& suf) {
+    if (s.size() < suf.size()) return false;
+    return ToLowerCd(s.substr(s.size() - suf.size())) == ToLowerCd(suf);
+}
+
+bool SourceFileLooksLikeEntryPoint(const std::filesystem::path& file_abs) {
+    std::string text;
+    if (!fs_util::ReadFileTextLong(file_abs, text)) return false;
+    if (text.size() > 512 * 1024) text.resize(512 * 1024);
+    return text.find("main(") != std::string::npos ||
+           text.find("main (") != std::string::npos ||
+           text.find("wmain(") != std::string::npos ||
+           text.find("WinMain(") != std::string::npos ||
+           text.find("wWinMain(") != std::string::npos;
 }
 
 } // namespace
@@ -477,6 +526,27 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
     std::vector<ParsedTu> parsed_tus;
     parsed_tus.reserve(arr.size());
     std::unordered_set<std::string> seen_tu_keys;
+    std::unordered_map<std::string, std::vector<std::string>> rsp_cache;
+    std::unordered_map<std::string, std::pair<std::filesystem::path, std::filesystem::path>> cmake_dir_by_target;
+
+    auto extract_cmake_dir = [&](const std::string& out_s, const std::filesystem::path& entry_dir) -> std::filesystem::path {
+        std::string norm = out_s;
+        std::replace(norm.begin(), norm.end(), '\\', '/');
+        size_t pos = norm.find("CMakeFiles/");
+        if (pos == std::string::npos) return {};
+        size_t dir_end = norm.find(".dir/", pos + 11);
+        if (dir_end == std::string::npos) {
+            if (norm.size() >= 4 && norm.rfind(".dir") == norm.size() - 4) dir_end = norm.size() - 4;
+            else return {};
+        }
+        std::filesystem::path rel_dir = std::filesystem::u8path(norm.substr(0, dir_end + 4));
+        if (rel_dir.is_absolute()) return rel_dir;
+        std::filesystem::path c1 = compdb_dir / rel_dir;
+        if (fs_util::ExistsLong(c1)) return c1;
+        std::filesystem::path c2 = entry_dir / rel_dir;
+        if (fs_util::ExistsLong(c2)) return c2;
+        return {};
+    };
 
     auto resolve_entry_path = [&](const std::string& p, const std::filesystem::path& base_dir) -> std::string {
         std::filesystem::path fp = std::filesystem::u8path(p);
@@ -539,7 +609,7 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
         argv.push_back(raw_argv[0]);
         if (raw_argv.size() > 1) {
             std::vector<std::string> tail(raw_argv.begin() + 1, raw_argv.end());
-            ExpandResponseFilesRecursive(tail, entry_dir, project_root, argv);
+            ExpandResponseFilesRecursive(tail, entry_dir, project_root, argv, rsp_cache);
         }
 
         std::string out_s = entry.value("output", "");
@@ -551,6 +621,12 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
         }
 
         std::string tname = extract_cmake_target(out_s);
+        if (!tname.empty() && cmake_dir_by_target.find(tname) == cmake_dir_by_target.end()) {
+            std::filesystem::path cdir = extract_cmake_dir(out_s, entry_dir);
+            if (!cdir.empty()) {
+                cmake_dir_by_target[tname] = { cdir, entry_dir };
+            }
+        }
         if (tname.empty()) {
             std::filesystem::path rp(file_rel);
             std::string top = rp.has_parent_path() ? rp.parent_path().begin()->generic_u8string() : "";
@@ -704,6 +780,9 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
         }
     }
 
+    std::unordered_set<std::string> all_target_names;
+    for (const auto& tname : target_order) all_target_names.insert(tname);
+
     for (const auto& tname : target_order) {
         const auto& tus = by_target[tname];
         ImportedTargetSuggestion ts;
@@ -712,14 +791,94 @@ ImportPlan CompDbManager::AnalyzeCompileCommands(
         for (const ParsedTu* tu : tus) {
             if (tu->sharedHint) { has_shared_hint = true; break; }
         }
-        std::string low_tn = ToLowerCd(tname);
-        if (has_shared_hint) {
-            ts.kind = TargetKind::Shared;
-        } else if (low_tn.find("lib") != std::string::npos || low_tn == "imgui" || low_tn == "glfw" ||
-                   low_tn == "reproc" || low_tn == "reproc++" || low_tn == "nfd" || low_tn == "core") {
-            ts.kind = TargetKind::Static;
-        } else {
-            ts.kind = TargetKind::Executable;
+
+        // Parse CMake link.txt + linkLibs.rsp when available for exact target kind, deps, and libs
+        bool resolved_from_link_txt = false;
+        auto cm_it = cmake_dir_by_target.find(tname);
+        if (cm_it != cmake_dir_by_target.end()) {
+            std::filesystem::path link_txt = cm_it->second.first / "link.txt";
+            std::string link_raw;
+            if (fs_util::ReadFileTextLong(link_txt, link_raw)) {
+                resolved_from_link_txt = true;
+                std::vector<std::string> link_raw_toks = SplitCommandLine(link_raw);
+                std::vector<std::string> link_toks;
+                ExpandResponseFilesRecursive(link_raw_toks, cm_it->second.second, project_root, link_toks, rsp_cache);
+
+                bool saw_ar = false;
+                bool saw_shared = has_shared_hint;
+                bool saw_exe_out = false;
+                bool saw_lib_out = false;
+                std::unordered_set<std::string> seen_deps, seen_libs;
+
+                for (size_t li = 0; li < link_toks.size(); ++li) {
+                    const std::string& lt = link_toks[li];
+                    std::string low_lt = ToLowerCd(lt);
+                    std::string fname_low = ToLowerCd(std::filesystem::u8path(lt).filename().generic_u8string());
+                    if (fname_low == "ar" || fname_low == "ar.exe" || fname_low == "gcc-ar" || fname_low == "gcc-ar.exe" ||
+                        fname_low == "llvm-ar" || fname_low == "llvm-ar.exe" || fname_low == "lib.exe") {
+                        saw_ar = true;
+                    }
+                    if (lt == "-shared" || lt == "/DLL" || lt == "/LD" || lt == "/LDd") {
+                        saw_shared = true;
+                    }
+                    if ((lt == "-o" || lt == "/OUT:") && li + 1 < link_toks.size()) {
+                        std::string out_arg = link_toks[li + 1];
+                        if (EndsWithCiCd(out_arg, ".exe")) saw_exe_out = true;
+                        else if (EndsWithCiCd(out_arg, ".dll") || EndsWithCiCd(out_arg, ".so") || EndsWithCiCd(out_arg, ".dylib")) saw_shared = true;
+                        else if (EndsWithCiCd(out_arg, ".a") || EndsWithCiCd(out_arg, ".lib")) saw_lib_out = true;
+                    }
+                    if (lt.rfind("/OUT:", 0) == 0) {
+                        if (EndsWithCiCd(lt, ".exe")) saw_exe_out = true;
+                        else if (EndsWithCiCd(lt, ".dll")) saw_shared = true;
+                        else if (EndsWithCiCd(lt, ".lib")) saw_lib_out = true;
+                    }
+
+                    // Extract inter-target deps and external/system libs from link.txt / linkLibs.rsp
+                    if (lt.rfind("-l", 0) == 0 && lt.size() > 2) {
+                        std::string lname = lt.substr(2);
+                        if (lname != tname && seen_libs.insert(lname).second) {
+                            ts.libs.push_back(lname);
+                        }
+                    } else if ((EndsWithCiCd(lt, ".a") || EndsWithCiCd(lt, ".lib") || EndsWithCiCd(lt, ".dll.a") ||
+                                EndsWithCiCd(lt, ".so") || EndsWithCiCd(lt, ".dylib")) &&
+                               low_lt.find("cmakefiles/") == std::string::npos &&
+                               fname_low != "objects.a") {
+                        std::string cand = ExtractTargetTokenFromLibPath(lt);
+                        if (!cand.empty() && cand != tname && all_target_names.count(cand)) {
+                            if (seen_deps.insert(cand).second) ts.deps.push_back(cand);
+                        } else if (!cand.empty() && cand != tname && lt.find("-l") != 0 &&
+                                   lt.rfind("CMakeFiles", 0) != 0 && fname_low != ("lib" + ToLowerCd(tname) + ".a")) {
+                            std::string norm_lib = lt;
+                            std::replace(norm_lib.begin(), norm_lib.end(), '\\', '/');
+                            if (seen_libs.insert(norm_lib).second) ts.libs.push_back(norm_lib);
+                        }
+                    }
+                }
+
+                if (saw_shared) ts.kind = TargetKind::Shared;
+                else if (saw_exe_out) ts.kind = TargetKind::Executable;
+                else if (saw_ar || saw_lib_out) ts.kind = TargetKind::Static;
+                else ts.kind = TargetKind::Executable;
+            }
+        }
+
+        if (!resolved_from_link_txt) {
+            std::string low_tn = ToLowerCd(tname);
+            if (has_shared_hint) {
+                ts.kind = TargetKind::Shared;
+            } else if (low_tn.find("lib") != std::string::npos || low_tn == "imgui" || low_tn == "glfw" ||
+                       low_tn == "reproc" || low_tn == "reproc++" || low_tn == "nfd" || low_tn == "core") {
+                ts.kind = TargetKind::Static;
+            } else {
+                bool has_main = false;
+                for (const ParsedTu* tu : tus) {
+                    if (SourceFileLooksLikeEntryPoint(project_root / std::filesystem::u8path(tu->fileRel))) {
+                        has_main = true;
+                        break;
+                    }
+                }
+                ts.kind = has_main ? TargetKind::Executable : TargetKind::Static;
+            }
         }
 
         std::vector<std::vector<std::string>> t_inc, t_sys, t_def, t_cf;
@@ -818,6 +977,7 @@ bool CompDbManager::WriteImportedProject(
         t.name = ts.name;
         t.kind = ts.kind;
         t.deps = ts.deps;
+        t.priv.libs = ts.libs;
         t.priv.includeDirs = ts.includeDirs;
         t.priv.systemIncludeDirs = ts.systemIncludeDirs;
         t.priv.defines = ts.defines;

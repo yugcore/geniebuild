@@ -400,9 +400,9 @@ inline TreeRowResult RenderTreeRow(
         const float btn_y = row_min.y + (row_height - btn_h) * 0.5f;
 
         ImGui::SetCursorScreenPos(ImVec2(btn_x, btn_y));
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.20f, 0.23f, 0.80f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.20f, 0.20f, 0.95f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.65f, 0.12f, 0.12f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_Button,        Theme::Col::Button);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Theme::Col::Danger);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  Theme::Col::Error);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f * dpi);
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
 

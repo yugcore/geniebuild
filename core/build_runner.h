@@ -219,6 +219,12 @@ private:
     std::string m_executed_command;
     std::chrono::high_resolution_clock::time_point m_start_time;
 
+    uint64_t m_last_compdb_revision = 0;
+    std::filesystem::path m_last_compdb_root;
+    std::string m_last_compdb_config;
+    std::string m_last_compdb_tc;
+    std::string m_last_compdb_cfg_key;
+
     void WorkerRun(
         const Project* project,
         const CompilerManager* compiler_manager,
